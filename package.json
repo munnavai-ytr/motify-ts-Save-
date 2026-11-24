@@ -10,6 +10,8 @@
     "clean": "next clean"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "0.12.10",
+    "@ffmpeg/util": "0.12.2",
     "@remotion/media": "4.0.544",
     "@remotion/player": "4.0.544",
     "@remotion/web-renderer": "4.0.544",
