@@ -3,11 +3,17 @@ import { z } from 'zod';
 export const EDIT_SPEC_VERSION = 2 as const;
 export const EDIT_SPEC_FPS = 30 as const;
 export const MAX_TIMELINE_SECONDS = 300;
-export const MAX_AV_TRACKS = 8;
+export const MAX_AV_TRACKS = 12;
 export const MAX_INPUT_VIDEO_BYTES = 300 * 1024 * 1024;
 
 export const EDIT_FORMATS = ['9:16', '16:9', '1:1'] as const;
 export type EditFormat = (typeof EDIT_FORMATS)[number];
+
+export const VIDEO_FITS = ['cover', 'contain', 'blur'] as const;
+export type VideoFit = (typeof VIDEO_FITS)[number];
+
+export const CAPTION_POSITIONS = ['bottom', 'center'] as const;
+export type CaptionPosition = (typeof CAPTION_POSITIONS)[number];
 
 export const FORMAT_DIMENSIONS: Record<
   EditFormat,
@@ -47,6 +53,7 @@ export const VideoTrackSchema = z
     volume: z.number().finite().min(0).max(2).optional(),
     speed: z.number().finite().min(0.5).max(2).optional(),
     colorGrade: z.string().trim().optional(),
+    fit: z.enum(VIDEO_FITS).optional(),
   })
   .refine((t) => t.outPoint > t.inPoint, {
     message: 'VideoTrack.outPoint must be greater than inPoint',
@@ -105,6 +112,18 @@ export const TrackSchema = z.discriminatedUnion('kind', [
   MGTrackSchema,
 ]);
 
+export const CaptionSchema = z
+  .object({
+    text: z.string().trim().min(1, 'Caption.text is required'),
+    start: z.number().finite().min(0, 'Caption.start must be >= 0'),
+    end: z.number().finite().positive('Caption.end must be > 0'),
+    position: z.enum(CAPTION_POSITIONS).default('bottom'),
+  })
+  .refine((c) => c.end > c.start, {
+    message: 'Caption.end must be greater than start',
+    path: ['end'],
+  });
+
 export const EditSpecSchema = z.object({
   v: z.literal(EDIT_SPEC_VERSION),
   format: EditFormatSchema,
@@ -116,6 +135,7 @@ export const EditSpecSchema = z.object({
     .max(MAX_TIMELINE_SECONDS, `totalSeconds must be <= ${MAX_TIMELINE_SECONDS}`),
   colorGrade: ColorGradeSchema.optional(),
   tracks: z.array(TrackSchema).min(1, 'EditSpec must include at least one track'),
+  captions: z.array(CaptionSchema).optional(),
 });
 
 export const EDIT_SPEC_JSON_SCHEMA: Record<string, unknown> = {
@@ -134,6 +154,24 @@ export const EDIT_SPEC_JSON_SCHEMA: Record<string, unknown> = {
       type: 'STRING',
       enum: [...COLOR_GRADES],
       nullable: true,
+    },
+    captions: {
+      type: 'ARRAY',
+      nullable: true,
+      items: {
+        type: 'OBJECT',
+        required: ['text', 'start', 'end', 'position'],
+        properties: {
+          text: { type: 'STRING', nullable: false },
+          start: { type: 'NUMBER', nullable: false },
+          end: { type: 'NUMBER', nullable: false },
+          position: {
+            type: 'STRING',
+            enum: [...CAPTION_POSITIONS],
+            nullable: false,
+          },
+        },
+      },
     },
     tracks: {
       type: 'ARRAY',
@@ -154,6 +192,11 @@ export const EDIT_SPEC_JSON_SCHEMA: Record<string, unknown> = {
           volume: { type: 'NUMBER', nullable: true },
           speed: { type: 'NUMBER', nullable: true },
           colorGrade: { type: 'STRING', nullable: true },
+          fit: {
+            type: 'STRING',
+            enum: [...VIDEO_FITS],
+            nullable: true,
+          },
           fadeIn: { type: 'NUMBER', nullable: true },
           fadeOut: { type: 'NUMBER', nullable: true },
           loop: { type: 'BOOLEAN', nullable: true },
@@ -193,6 +236,7 @@ export type OverlayBorder = z.infer<typeof OverlayBorderSchema>;
 export type OverlayTrack = z.infer<typeof OverlayTrackSchema>;
 export type MGTrack = z.infer<typeof MGTrackSchema>;
 export type Track = z.infer<typeof TrackSchema>;
+export type CaptionItem = z.infer<typeof CaptionSchema>;
 export type EditSpec = z.infer<typeof EditSpecSchema>;
 
 export type NormalizeEditSpecResult =
@@ -225,6 +269,21 @@ function isKnownColorGrade(value: string): value is ColorGradePreset {
   return (COLOR_GRADES as readonly string[]).includes(value);
 }
 
+function isKnownVideoFit(value: string): value is VideoFit {
+  return (VIDEO_FITS as readonly string[]).includes(value);
+}
+
+function stripNullOptionalKeys(
+  obj: Record<string, unknown>,
+  keys: readonly string[]
+): void {
+  for (const key of keys) {
+    if (obj[key] === null) {
+      delete obj[key];
+    }
+  }
+}
+
 export function normalizeEditSpec(raw: unknown): NormalizeEditSpecResult {
   const warnings: string[] = [];
   let parsedInput: unknown = raw;
@@ -243,6 +302,7 @@ export function normalizeEditSpec(raw: unknown): NormalizeEditSpecResult {
   }
 
   const candidate: Record<string, unknown> = { ...parsedInput };
+  stripNullOptionalKeys(candidate, ['colorGrade', 'captions']);
 
   if (candidate.v === undefined) {
     candidate.v = EDIT_SPEC_VERSION;
@@ -269,10 +329,45 @@ export function normalizeEditSpec(raw: unknown): NormalizeEditSpecResult {
     }
   }
 
+  if (Array.isArray(candidate.captions)) {
+    candidate.captions = candidate.captions
+      .filter((entry): entry is Record<string, unknown> => isRecord(entry))
+      .map((entry) => {
+        const next: Record<string, unknown> = { ...entry };
+        if (typeof next.position === 'string') {
+          const pos = next.position.trim().toLowerCase();
+          next.position = pos === 'center' ? 'center' : 'bottom';
+        } else if (next.position === undefined || next.position === null) {
+          next.position = 'bottom';
+        }
+        return next;
+      });
+  }
+
   if (Array.isArray(candidate.tracks)) {
     candidate.tracks = candidate.tracks.map((rawTrack, index) => {
       if (!isRecord(rawTrack)) return rawTrack;
       const track: Record<string, unknown> = { ...rawTrack };
+      stripNullOptionalKeys(track, [
+        'mediaId',
+        'inPoint',
+        'outPoint',
+        'volume',
+        'speed',
+        'colorGrade',
+        'fit',
+        'fadeIn',
+        'fadeOut',
+        'loop',
+        'duration',
+        'x',
+        'y',
+        'scale',
+        'opacity',
+        'shadow',
+        'border',
+        'specJson',
+      ]);
       const kind = track.kind;
 
       if (kind === 'video') {
@@ -302,6 +397,17 @@ export function normalizeEditSpec(raw: unknown): NormalizeEditSpecResult {
             );
           }
           track.colorGrade = normalizedGrade;
+        }
+        if (typeof track.fit === 'string') {
+          const normalizedFit = track.fit.trim().toLowerCase();
+          if (!isKnownVideoFit(normalizedFit)) {
+            warnings.push(
+              `tracks[${index}].fit "${track.fit}" is unknown; defaulted to "cover".`
+            );
+            track.fit = 'cover';
+          } else {
+            track.fit = normalizedFit;
+          }
         }
       } else if (kind === 'audio') {
         if (track.inPoint === undefined) {
@@ -380,14 +486,10 @@ export function normalizeEditSpec(raw: unknown): NormalizeEditSpecResult {
     (t): t is VideoTrack => t.kind === 'video'
   );
   const mgTracks = spec.tracks.filter((t): t is MGTrack => t.kind === 'mg');
-  if (mgTracks.length > 0) {
-    warnings.push(
-      `${mgTracks.length} MGTrack item(s) detected; MG tracks are skipped in V1 compositor and will be rendered in V3.`
-    );
-  }
-  if (videoTracks.length === 0) {
+  if (videoTracks.length === 0 && mgTracks.length === 0) {
     warnings.push('No VideoTrack present; compositor will generate a black base canvas.');
   }
 
   return { ok: true, spec, warnings };
 }
+

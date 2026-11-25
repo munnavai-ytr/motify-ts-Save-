@@ -9,6 +9,7 @@ import {
   GEMINI_MODEL_STORAGE,
   PROJECT_FORMAT_STORAGE_PREFIX,
   THEME_STORAGE,
+  USE_MEDIA_STORAGE,
 } from './constants';
 import type { ExportMode, FormatPreference, ThemePreference } from './types';
 
@@ -189,6 +190,18 @@ export function getStoredAutoBuild(): boolean {
 
 export function setStoredAutoBuild(enabled: boolean): void {
   writeStorage(AUTO_BUILD_STORAGE, enabled ? 'true' : 'false');
+}
+
+export function getStoredUseMedia(): boolean {
+  const raw = readStorage(USE_MEDIA_STORAGE);
+  if (raw === 'false') {
+    return false;
+  }
+  return true;
+}
+
+export function setStoredUseMedia(enabled: boolean): void {
+  writeStorage(USE_MEDIA_STORAGE, enabled ? 'true' : 'false');
 }
 
 function isFormatPreference(value: string | null): value is FormatPreference {

@@ -17,7 +17,7 @@ CAPABILITIES & HONEST BOUNDARIES
 - We render clean, crisp 2D motion graphics in code: animated typography, kinetic headlines, geometric shapes, crisp SVG icons/illustrations, badges, grids, progress bars, counters, and simple animated charts.
 - Motion Kit videos also include browser-synthesized royalty-free background music (lofi, corporate, upbeat-pop, cinematic, playful, tech-pulse, ambient) and timeline-synced sound effects (auto, minimal, off), or user-uploaded background audio, included in previews and exported MP4s. Voice-over narration is not synthesized.
 - Users may attach images, short video clips, audio clips, PDFs, or text files as references, copy sources, scripts, or creative inspiration for their chat conversation and video plans.
-- Rendered 2D motion scenes themselves are code-based typography/SVG/shapes and do not composite raw camera footage; be honest about camera footage or voice-over requests while using everything attached to design their plan and sound mood.
+- Rendered 2D motion scenes themselves are code-based typography/SVG/shapes, while MotionAI also has a Media Edit engine (FFmpeg) for user-uploaded footage/photos when requested; be honest about camera footage or voice-over requests in 2D motion scenes while using everything attached to design their plan and sound mood.
 
 ${ROUTER_RULES}
 
@@ -208,6 +208,8 @@ function summarizeMessageForContext(msg: ChatMessage): string | null {
       const okCount = msg.scenes.filter((s) => s.status === 'ok').length;
       return `System (Video v${msg.version} from Plan v${msg.planVersion}): ${msg.status}, ${okCount}/${msg.scenes.length} scenes built.`;
     }
+    case 'media_video':
+      return `Studio (Media Edit v${msg.version}, ${msg.format}, ${Math.round(msg.durationSec)}s): "${msg.brief}"`;
     case 'system_notice':
       return `System: ${msg.content}`;
     case 'error':

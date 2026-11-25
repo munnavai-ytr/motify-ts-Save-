@@ -34,6 +34,76 @@ export function buildInitialRunSteps(hasAttachments = false): RunStep[] {
   return steps;
 }
 
+export function buildInitialMediaRunSteps(options?: {
+  skipAnalyze?: boolean;
+  includeHybrid?: boolean;
+}): RunStep[] {
+  const steps: RunStep[] = [
+    { id: 'understand', label: 'Reading your request', status: 'pending' },
+  ];
+  if (!options?.skipAnalyze) {
+    steps.push({
+      id: 'analyze',
+      label: 'Looking at your media',
+      status: 'pending',
+    });
+  }
+  steps.push(
+    { id: 'plan_edit', label: 'Planning the edit', status: 'pending' },
+    { id: 'check_edit', label: 'Checking the edit', status: 'pending' },
+    ...(options?.includeHybrid
+      ? [
+          {
+            id: 'design' as const,
+            label: 'Preparing motion graphics',
+            status: 'pending' as const,
+          },
+        ]
+      : []),
+    { id: 'render', label: 'Rendering your video', status: 'pending' },
+    { id: 'save', label: 'Saving', status: 'pending' }
+  );
+  return steps;
+}
+
+export function createMediaAgentRun(input: {
+  projectId: string;
+  userMessageId: string;
+  userPrompt: string;
+  action: 'media' | 'hybrid';
+  skipAnalyze?: boolean;
+  includeHybrid?: boolean;
+  modelName?: string;
+  requestedModelName?: string;
+}): AgentRun {
+  const now = Date.now();
+  return {
+    id: createDbId(),
+    projectId: input.projectId,
+    userMessageId: input.userMessageId,
+    userPrompt: input.userPrompt,
+    status: 'running',
+    action: input.action,
+    steps: buildInitialMediaRunSteps({
+      skipAnalyze: input.skipAnalyze,
+      includeHybrid: input.includeHybrid,
+    }),
+    artifacts: {},
+    usage: {
+      requests: 0,
+      promptTokens: 0,
+      outputTokens: 0,
+      thoughtTokens: 0,
+    },
+    ...(input.modelName ? { modelName: input.modelName } : {}),
+    ...(input.requestedModelName
+      ? { requestedModelName: input.requestedModelName }
+      : {}),
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
 export function createAgentRun(input: {
   projectId: string;
   userMessageId: string;

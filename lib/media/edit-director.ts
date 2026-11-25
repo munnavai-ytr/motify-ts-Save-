@@ -1,6 +1,7 @@
 import {
   buildThinkingConfig,
   type GeminiContent,
+  type GeminiStatusEvent,
 } from '@/lib/ai/gemini-client';
 import { callGeminiWithPolicy } from '@/lib/ai/gemini-policy';
 import { extractJsonFromText } from '@/lib/ai/plan-schema';
@@ -11,6 +12,7 @@ import { EDIT_DIRECTOR_PROMPT } from './edit-director-prompt';
 import {
   COLOR_GRADES,
   EDIT_SPEC_JSON_SCHEMA,
+  MAX_TIMELINE_SECONDS,
   normalizeEditSpec,
   type ColorGradePreset,
   type EditFormat,
@@ -40,6 +42,12 @@ export interface GenerateEditSpecInput {
   format: EditFormat;
   targetSeconds: number;
   language: 'en' | 'bn' | 'auto';
+  referenceOnly?: boolean;
+  referenceMediaIds?: string[];
+  existingEditSpec?: EditSpec;
+  allowHybridMG?: boolean;
+  backupModelName?: string;
+  onGeminiStatus?: (event: GeminiStatusEvent) => void;
 }
 
 export interface EditDirectorTokens {
@@ -55,6 +63,8 @@ export interface EditDirectorResult {
   calls: number;
   tokens: EditDirectorTokens;
   ms: number;
+  modelName?: string;
+  usedBackupModel?: boolean;
 }
 
 export interface EnrichRequestOptions {
@@ -246,14 +256,34 @@ function getEditDirectorResponseSchema(): Record<string, unknown> {
   };
 }
 
-function buildMediaSummaryTable(mediaItems: MediaItem[]): string {
+function buildMediaSummaryTable(
+  mediaItems: MediaItem[],
+  analysis: MediaAnalysis | null,
+  referenceSet: Set<string>
+): string {
   if (mediaItems.length === 0) {
     return 'No media items uploaded.';
   }
-  const header = 'mediaId | kind | name | duration | size';
-  const divider = '--- | --- | --- | --- | ---';
+  const analysisById = new Map(
+    (analysis?.items ?? []).map((item) => [item.mediaId, item])
+  );
+  const header = 'mediaId | kind | role | name | dimensions | duration | size';
+  const divider = '--- | --- | --- | --- | --- | --- | ---';
   const rows = mediaItems.map((item, idx) => {
     const id = resolveMediaId(item, idx);
+    const analyzed = analysisById.get(id);
+    const role = referenceSet.has(id)
+      ? 'REFERENCE ONLY (style inspiration - DO NOT place on timeline)'
+      : item.kind === 'audio'
+        ? analyzed?.audioRole ?? 'audio'
+        : 'timeline';
+    const dims =
+      typeof item.width === 'number' &&
+      typeof item.height === 'number' &&
+      item.width > 0 &&
+      item.height > 0
+        ? `${item.width}x${item.height}`
+        : 'unknown';
     const dur =
       typeof item.duration === 'number' &&
       Number.isFinite(item.duration) &&
@@ -262,7 +292,7 @@ function buildMediaSummaryTable(mediaItems: MediaItem[]): string {
         : item.kind === 'image'
           ? 'still'
           : 'unknown';
-    return `${id} | ${item.kind} | ${item.name} | ${dur} | ${formatBytes(item.size)}`;
+    return `${id} | ${item.kind} | ${role} | ${item.name} | ${dims} | ${dur} | ${formatBytes(item.size)}`;
   });
   return [header, divider, ...rows].join('\n');
 }
@@ -292,13 +322,32 @@ function buildUserPrompt(
   effectiveRequest: string,
   input: GenerateEditSpecInput
 ): string {
-  const mediaTable = buildMediaSummaryTable(input.mediaItems);
-  return [
+  const referenceSet = new Set(input.referenceMediaIds ?? []);
+  const mediaTable = buildMediaSummaryTable(
+    input.mediaItems,
+    input.analysis,
+    referenceSet
+  );
+  const sections: string[] = [
     `USER REQUEST:\n${effectiveRequest}`,
-    `TARGET SETTINGS:\n- format: ${input.format}\n- targetSeconds: ${input.targetSeconds}\n- language: ${input.language}`,
+    `TARGET SETTINGS:\n- format: ${input.format}\n- targetSeconds: ${input.targetSeconds}\n- language: ${input.language}\n- allowHybridMG: ${input.allowHybridMG !== false ? 'yes (use MGTrack only if branding/intro/outro/CTA helps)' : 'no (omit MGTracks)'}`,
     `UPLOADED MEDIA SUMMARY:\n${mediaTable}`,
-    'Return valid JSON matching EditSpec + brief.',
-  ].join('\n\n');
+  ];
+
+  if (referenceSet.size > 0) {
+    sections.push(
+      `REFERENCE ONLY IDS (extract style/grade/pacing, NEVER place on any track): ${Array.from(referenceSet).join(', ')}`
+    );
+  }
+
+  if (input.existingEditSpec) {
+    sections.push(
+      `PREVIOUS EDIT SPEC (revise this timeline according to USER REQUEST):\n${JSON.stringify(input.existingEditSpec)}`
+    );
+  }
+
+  sections.push('Return valid JSON matching EditSpec + brief.');
+  return sections.join('\n\n');
 }
 
 function addUsageTokens(
@@ -323,17 +372,39 @@ function clampBriefWords(rawBrief: unknown, fallback: string): string {
 
 function validateAgainstMediaItems(
   spec: EditSpec,
-  mediaItems: MediaItem[]
+  mediaItems: MediaItem[],
+  referenceIds: ReadonlyArray<string> = []
 ): string[] {
   const errors: string[] = [];
   const itemById = new Map<string, MediaItem>();
+  const referenceSet = new Set(referenceIds);
 
   mediaItems.forEach((item, idx) => {
     itemById.set(resolveMediaId(item, idx), item);
   });
 
+  if (spec.totalSeconds > MAX_TIMELINE_SECONDS) {
+    errors.push(
+      `totalSeconds (${spec.totalSeconds}s) exceeds maximum allowed ${MAX_TIMELINE_SECONDS}s.`
+    );
+  }
+
   spec.tracks.forEach((track, idx) => {
-    if (track.kind === 'mg') return;
+    if (track.kind === 'mg') {
+      if (track.duration > 5) {
+        errors.push(
+          `tracks[${idx}].duration (${track.duration}s) for MGTrack must be <= 5s.`
+        );
+      }
+      return;
+    }
+
+    if (referenceSet.has(track.mediaId)) {
+      errors.push(
+        `tracks[${idx}].mediaId "${track.mediaId}" is a REFERENCE ONLY item and must NOT be placed on the timeline.`
+      );
+      return;
+    }
 
     const media = itemById.get(track.mediaId);
     if (!media) {
@@ -345,6 +416,7 @@ function validateAgainstMediaItems(
 
     if (
       track.kind === 'video' &&
+      media.kind === 'video' &&
       typeof media.duration === 'number' &&
       Number.isFinite(media.duration) &&
       media.duration > 0 &&
@@ -421,6 +493,7 @@ export async function generateEditSpec(
   const firstRes = await callGeminiWithPolicy({
     apiKey,
     modelName,
+    backupModelName: input.backupModelName,
     systemInstruction,
     contents,
     responseMimeType: 'application/json',
@@ -428,6 +501,7 @@ export async function generateEditSpec(
     temperature: 0.7,
     maxOutputTokens: 3000,
     thinkingConfig,
+    onStatus: input.onGeminiStatus,
     signal,
   });
   addUsageTokens(tokens, firstRes.usageMetadata);
@@ -459,7 +533,8 @@ export async function generateEditSpec(
 
     const mediaErrors = validateAgainstMediaItems(
       normalized.spec,
-      input.mediaItems
+      input.mediaItems,
+      input.referenceMediaIds
     );
     if (mediaErrors.length > 0) {
       return { ok: false, errors: mediaErrors };
@@ -483,6 +558,8 @@ export async function generateEditSpec(
       calls,
       tokens,
       ms: Math.round(performance.now() - startedAt),
+      modelName: firstRes.answeringModel,
+      usedBackupModel: firstRes.usedBackup,
     };
   }
 
@@ -500,7 +577,7 @@ export async function generateEditSpec(
       role: 'user',
       parts: [
         {
-          text: `Your previous JSON failed validation with these errors:\n${firstEval.errors.join('\n')}\n\nFix ALL errors and return ONLY the corrected EditSpec JSON with "brief". Only use mediaIds from the uploaded media list and stay within each source duration.`,
+          text: `Your previous JSON failed validation with these errors:\n${firstEval.errors.join('\n')}\n\nFix ALL errors and return ONLY the corrected EditSpec JSON with "brief". Only use allowed timeline mediaIds from the uploaded media list and stay within each source duration.`,
         },
       ],
     },
@@ -509,6 +586,7 @@ export async function generateEditSpec(
   const repairRes = await callGeminiWithPolicy({
     apiKey,
     modelName,
+    backupModelName: input.backupModelName,
     systemInstruction,
     contents: repairContents,
     responseMimeType: 'application/json',
@@ -516,6 +594,7 @@ export async function generateEditSpec(
     temperature: 0.7,
     maxOutputTokens: 3000,
     thinkingConfig,
+    onStatus: input.onGeminiStatus,
     signal,
   });
   addUsageTokens(tokens, repairRes.usageMetadata);
@@ -529,6 +608,8 @@ export async function generateEditSpec(
       calls,
       tokens,
       ms: Math.round(performance.now() - startedAt),
+      modelName: repairRes.answeringModel,
+      usedBackupModel: firstRes.usedBackup || repairRes.usedBackup,
     };
   }
 
@@ -536,3 +617,4 @@ export async function generateEditSpec(
     `AI Edit Director failed validation after repair attempt: ${secondEval.errors.join('; ')}`
   );
 }
+

@@ -5,7 +5,10 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Clapperboard,
   Copy,
+  Eye,
+  Film,
   Layers,
   Loader2,
   MessageSquare,
@@ -38,6 +41,10 @@ const STEP_ICONS: Record<RunStepId, React.ComponentType<{ className?: string }>>
   apply: Layers,
   check: ShieldCheck,
   save: Save,
+  analyze: Eye,
+  plan_edit: Clapperboard,
+  check_edit: ShieldCheck,
+  render: Film,
 };
 
 function formatTokenShort(n: number): string {
@@ -180,8 +187,9 @@ export function ThinkingBlock({
 
   const summaryLine = (() => {
     const parts: string[] = [];
+    const isMediaAction = run?.action === 'media' || run?.action === 'hybrid';
     if (elapsedMs > 0 || run) {
-      parts.push(`Thought for ${totalSeconds} s`);
+      parts.push(`${isMediaAction ? 'Worked' : 'Thought'} for ${totalSeconds} s`);
     } else {
       parts.push('Thought details');
     }

@@ -34,6 +34,7 @@ import {
   getStoredAutoBuild,
   getStoredDailyRequestLimits,
   getStoredDefaultFormat,
+  getStoredUseMedia,
   normalizeModelStorageKey,
   setStoredApiKey,
   setStoredAutoBuild,
@@ -41,6 +42,7 @@ import {
   setStoredDailyRequestLimit,
   setStoredDefaultFormat,
   setStoredModel,
+  setStoredUseMedia,
 } from '@/lib/storage';
 import { useTheme } from '@/lib/theme';
 import type { FormatPreference, SessionUsage, ThemePreference } from '@/lib/types';
@@ -65,6 +67,8 @@ interface SettingsSheetProps {
   models: GeminiModel[];
   autoBuild?: boolean;
   onAutoBuildChange?: (enabled: boolean) => void;
+  useMedia?: boolean;
+  onUseMediaChange?: (enabled: boolean) => void;
   defaultFormat?: FormatPreference;
   onDefaultFormatChange?: (format: FormatPreference) => void;
   sessionUsage: SessionUsage;
@@ -146,6 +150,8 @@ export function SettingsSheet({
   models,
   autoBuild,
   onAutoBuildChange,
+  useMedia,
+  onUseMediaChange,
   defaultFormat,
   onDefaultFormatChange,
   sessionUsage,
@@ -192,6 +198,10 @@ export function SettingsSheet({
     typeof window !== 'undefined' ? getStoredAutoBuild() : true
   );
   const effectiveAutoBuild = autoBuild ?? fallbackAutoBuild;
+  const [fallbackUseMedia, setFallbackUseMedia] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? getStoredUseMedia() : true
+  );
+  const effectiveUseMedia = useMedia ?? fallbackUseMedia;
   const [fallbackDefaultFormat, setFallbackDefaultFormat] =
     useState<FormatPreference>(() =>
       typeof window !== 'undefined' ? getStoredDefaultFormat() : 'auto'
@@ -755,6 +765,42 @@ export function SettingsSheet({
                   className={cn(
                     'inline-block h-4 w-4 rounded-full bg-white shadow transition-transform',
                     effectiveAutoBuild ? 'translate-x-6' : 'translate-x-1'
+                  )}
+                />
+              </button>
+            </div>
+
+            <div className="flex items-start justify-between gap-3 rounded-[12px] border border-border bg-surface-2/60 p-3.5">
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-text">
+                  Use my uploaded media automatically
+                </p>
+                <p className="text-[11px] leading-relaxed text-text-muted">
+                  When on, uploaded videos and photos are edited directly into your video when requested. When off, attachments only serve as inspiration for 2D motion graphics.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={effectiveUseMedia}
+                aria-label="Use my uploaded media automatically"
+                onClick={() => {
+                  const next = !effectiveUseMedia;
+                  setStoredUseMedia(next);
+                  setFallbackUseMedia(next);
+                  onUseMediaChange?.(next);
+                }}
+                className={cn(
+                  'relative mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                  effectiveUseMedia
+                    ? 'border-accent bg-accent'
+                    : 'border-border bg-surface-1'
+                )}
+              >
+                <span
+                  className={cn(
+                    'inline-block h-4 w-4 rounded-full bg-white shadow transition-transform',
+                    effectiveUseMedia ? 'translate-x-6' : 'translate-x-1'
                   )}
                 />
               </button>

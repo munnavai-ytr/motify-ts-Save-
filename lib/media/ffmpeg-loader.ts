@@ -78,6 +78,21 @@ export function getFFmpeg(): FFmpeg {
   return ffmpegInstance;
 }
 
+export function terminateFFmpeg(): void {
+  if (ffmpegInstance) {
+    try {
+      ffmpegInstance.terminate();
+    } catch {
+      // Ignore worker termination errors
+    }
+    ffmpegInstance = null;
+  }
+  cleanupBlobUrls();
+  loadingPromise = null;
+  lastError = null;
+  loadState = 'idle';
+}
+
 function cleanupBlobUrls(): void {
   if (coreBlobUrl) {
     URL.revokeObjectURL(coreBlobUrl);

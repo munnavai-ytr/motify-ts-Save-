@@ -29,13 +29,14 @@ import type {
   ErrorMessage,
   FormatPreference,
   MediaRecord,
+  MediaVideoMessage,
   PendingAttachment,
   PlanMessage,
   Project,
   QueuedMessageDraft,
   RunErrorMessage,
 } from '@/lib/types';
-import { isKitVideoMessage } from '@/lib/types';
+import { isKitVideoMessage, isMediaVideoMessage } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/components/ui/Toast';
 import { AttachmentMenu } from './AttachmentMenu';
@@ -45,6 +46,7 @@ import { KitVideoCard } from './KitVideoCard';
 import { LegacyPlanCard } from './LegacyPlanCard';
 import { LegacyVideoCard } from './LegacyVideoCard';
 import { MediaLightbox } from './MediaLightbox';
+import { MediaVideoCard } from './MediaVideoCard';
 import { MessageAttachments } from './MessageAttachments';
 import { ThinkingBlock } from './ThinkingBlock';
 
@@ -68,6 +70,7 @@ interface ChatPanelProps {
   onRetryAssistantTurn: (assistantMessageId: string) => void;
   onRetryError: (message: ErrorMessage | RunErrorMessage) => void;
   onUndoEdit?: (assistantMessageId: string) => void;
+  onRequestMediaEdit?: (message: MediaVideoMessage) => void;
   hasBackupModel?: boolean;
   onOpenSettings?: () => void;
   formatPreference?: FormatPreference;
@@ -223,6 +226,7 @@ export function ChatPanel({
   onRetryAssistantTurn,
   onRetryError,
   onUndoEdit,
+  onRequestMediaEdit,
   hasBackupModel = false,
   onOpenSettings,
   formatPreference = 'auto',
@@ -581,9 +585,12 @@ export function ChatPanel({
   };
 
   const planById = new Map<string, PlanMessage>();
+  let latestMediaVideoId: string | null = null;
   for (const msg of messages) {
     if (msg.type === 'plan') {
       planById.set(msg.id, msg);
+    } else if (isMediaVideoMessage(msg)) {
+      latestMediaVideoId = msg.id;
     }
   }
 
@@ -706,6 +713,21 @@ export function ChatPanel({
           />
         );
       }
+
+      case 'media_video':
+        return (
+          <MediaVideoCard
+            key={message.id}
+            message={message}
+            autoLoad={message.id === latestMediaVideoId}
+            onRequestEdit={(target) => {
+              onRequestMediaEdit?.(target);
+              window.requestAnimationFrame(() => {
+                textareaRef.current?.focus();
+              });
+            }}
+          />
+        );
 
       case 'error':
       case 'run_error':

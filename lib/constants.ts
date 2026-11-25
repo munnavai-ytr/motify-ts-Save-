@@ -9,6 +9,7 @@ export const THEME_STORAGE = 'motionai_theme';
 export const EXPORT_MODE_STORAGE = 'motionai_export_mode';
 export const ACTIVE_PROJECT_STORAGE = 'motionai_active_project_id';
 export const AUTO_BUILD_STORAGE = 'motionai_auto_build';
+export const USE_MEDIA_STORAGE = 'motionai_use_media';
 export const DEFAULT_FORMAT_STORAGE = 'motionai_default_format';
 export const PROJECT_FORMAT_STORAGE_PREFIX = 'motionai_format_';
 

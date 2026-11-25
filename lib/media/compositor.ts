@@ -24,6 +24,21 @@ export interface RenderOptions {
   fps?: number;
   maxDuration?: number;
   preset?: 'ultrafast' | 'superfast' | 'veryfast' | 'fast' | 'medium';
+  signal?: AbortSignal;
+  fontBlob?: Blob;
+  onWarning?: (warning: string) => void;
+}
+
+export function isOutOfMemoryError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  return (
+    msg.includes('out of memory') ||
+    msg.includes('oom') ||
+    msg.includes('cannot allocate') ||
+    msg.includes('allocation failed') ||
+    msg.includes('memory access out of bounds') ||
+    msg.includes('wasm memory')
+  );
 }
 
 export interface MediaProbeResult {
@@ -81,12 +96,27 @@ function inferExtension(blob: Blob, fallback: string): string {
   if (mime.includes('webm')) return 'webm';
   if (mime.includes('png')) return 'png';
   if (mime.includes('webp')) return 'webp';
+  if (mime.includes('gif')) return 'gif';
+  if (mime.includes('bmp')) return 'bmp';
   if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg';
   if (mime.includes('mpeg') || mime.includes('mp3')) return 'mp3';
   if (mime.includes('wav')) return 'wav';
   if (mime.includes('aac') || mime.includes('m4a')) return 'm4a';
   if (mime.includes('ogg')) return 'ogg';
   return fallback;
+}
+
+function isImageBlob(blob: Blob): boolean {
+  return blob.type.toLowerCase().startsWith('image/');
+}
+
+function escapeDrawtext(text: string): string {
+  return text
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/%/g, '\\%')
+    .replace(/\r?\n/g, ' ');
 }
 
 function toSafeUint8Array(data: Uint8Array | string): Uint8Array<ArrayBuffer> {
@@ -318,11 +348,16 @@ export async function renderEditSpec(
   const preset = options?.preset ?? 'ultrafast';
 
   return withFFmpegLock(async (ffmpeg) => {
+    if (options?.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
     const jobId = nextJobId();
     const writtenFiles: string[] = [];
     const outputPath = `${jobId}_output.mp4`;
     const mediaPathMap = new Map<string, string>();
     const mediaProbeMap = new Map<string, MediaProbeResult>();
+    const mediaBlobKindMap = new Map<string, 'image' | 'video' | 'audio'>();
 
     onProgress({ percent: 2, stage: 'Writing media files...' });
 
@@ -330,12 +365,21 @@ export async function renderEditSpec(
       // A) Write all unique input blobs to virtual FS
       let fileIndex = 0;
       for (const track of [...videoTracks, ...audioTracks, ...overlayTracks]) {
+        if (options?.signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
         if (mediaPathMap.has(track.mediaId)) continue;
         const blob = mediaBlobs.get(track.mediaId);
         if (!blob) continue;
 
-        const fallbackExt =
-          track.kind === 'video' ? 'mp4' : track.kind === 'audio' ? 'mp3' : 'png';
+        const isStill = isImageBlob(blob);
+        const fallbackExt = isStill
+          ? 'jpg'
+          : track.kind === 'video'
+            ? 'mp4'
+            : track.kind === 'audio'
+              ? 'mp3'
+              : 'png';
         const ext = inferExtension(blob, fallbackExt);
         const vfsPath = `${jobId}_media_${fileIndex}.${ext}`;
         fileIndex += 1;
@@ -344,11 +388,27 @@ export async function renderEditSpec(
         await ffmpeg.writeFile(vfsPath, bytes);
         writtenFiles.push(vfsPath);
         mediaPathMap.set(track.mediaId, vfsPath);
+        mediaBlobKindMap.set(
+          track.mediaId,
+          isStill ? 'image' : track.kind === 'audio' ? 'audio' : 'video'
+        );
 
-        if (track.kind === 'video') {
+        if (track.kind === 'video' && !isStill) {
           const probe = await probeVirtualFile(ffmpeg, vfsPath);
           mediaProbeMap.set(track.mediaId, probe);
         }
+      }
+
+      let captionFontPath: string | null = null;
+      if (spec.captions && spec.captions.length > 0 && options?.fontBlob) {
+        captionFontPath = `${jobId}_caption_font.ttf`;
+        const fontBytes = new Uint8Array(await options.fontBlob.arrayBuffer());
+        await ffmpeg.writeFile(captionFontPath, fontBytes);
+        writtenFiles.push(captionFontPath);
+      } else if (spec.captions && spec.captions.length > 0) {
+        options?.onWarning?.(
+          'Captions were skipped because no caption font file is bundled for FFmpeg.'
+        );
       }
 
       onProgress({ percent: 10, stage: 'Building render pipeline...' });
@@ -372,9 +432,10 @@ export async function renderEditSpec(
           const path = mediaPathMap.get(track.mediaId);
           if (!path) continue;
 
+          const isStillInput = mediaBlobKindMap.get(track.mediaId) === 'image';
           const probe = mediaProbeMap.get(track.mediaId);
-          const speed = track.speed ?? 1;
-          const volume = track.volume ?? 1;
+          const speed = isStillInput ? 1 : (track.speed ?? 1);
+          const volume = isStillInput ? 0 : (track.volume ?? 1);
           const rawClipDur = Math.max(0.05, track.outPoint - track.inPoint);
           const remainingBudget =
             maxDuration !== undefined
@@ -386,33 +447,78 @@ export async function renderEditSpec(
 
           const inputIdx = nextInputIdx;
           nextInputIdx += 1;
-          inputArgs.push(
-            '-ss',
-            track.inPoint.toFixed(3),
-            '-t',
-            trimDuration.toFixed(3),
-            '-i',
-            path
-          );
-
-          const vFilters: string[] = [];
-          if (Math.abs(speed - 1) > 0.001) {
-            vFilters.push(`setpts=PTS/${speed.toFixed(4)}`);
+          if (isStillInput) {
+            inputArgs.push(
+              '-loop',
+              '1',
+              '-framerate',
+              String(fps),
+              '-t',
+              trimDuration.toFixed(3),
+              '-i',
+              path
+            );
+          } else {
+            inputArgs.push(
+              '-ss',
+              track.inPoint.toFixed(3),
+              '-t',
+              trimDuration.toFixed(3),
+              '-i',
+              path
+            );
           }
-          vFilters.push(
-            `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
-            `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
-            'setsar=1',
-            `fps=${fps}`,
-            'format=yuv420p'
-          );
+
+          const fitMode = track.fit ?? 'cover';
           const trackGrade = getColorGradeFilter(track.colorGrade);
-          if (trackGrade) {
-            vFilters.push(trackGrade);
-          }
-          filterParts.push(`[${inputIdx}:v]${vFilters.join(',')}[vseg${i}]`);
 
-          const hasAudio = probe?.hasAudio ?? false;
+          if (fitMode === 'blur') {
+            const preFilters =
+              Math.abs(speed - 1) > 0.001
+                ? `setpts=PTS/${speed.toFixed(4)},`
+                : '';
+            filterParts.push(
+              `[${inputIdx}:v]${preFilters}split=2[vbg_src${i}][vfg_src${i}]`
+            );
+            filterParts.push(
+              `[vbg_src${i}]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},boxblur=20:5[vbg${i}]`
+            );
+            filterParts.push(
+              `[vfg_src${i}]scale=${width}:${height}:force_original_aspect_ratio=decrease[vfg${i}]`
+            );
+            const postFilters = [
+              'setsar=1',
+              `fps=${fps}`,
+              'format=yuv420p',
+              ...(trackGrade ? [trackGrade] : []),
+            ];
+            filterParts.push(
+              `[vbg${i}][vfg${i}]overlay=(W-w)/2:(H-h)/2,${postFilters.join(',')}[vseg${i}]`
+            );
+          } else {
+            const vFilters: string[] = [];
+            if (Math.abs(speed - 1) > 0.001) {
+              vFilters.push(`setpts=PTS/${speed.toFixed(4)}`);
+            }
+            if (fitMode === 'contain') {
+              vFilters.push(
+                `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
+                `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`
+              );
+            } else {
+              vFilters.push(
+                `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+                `crop=${width}:${height}`
+              );
+            }
+            vFilters.push('setsar=1', `fps=${fps}`, 'format=yuv420p');
+            if (trackGrade) {
+              vFilters.push(trackGrade);
+            }
+            filterParts.push(`[${inputIdx}:v]${vFilters.join(',')}[vseg${i}]`);
+          }
+
+          const hasAudio = !isStillInput && (probe?.hasAudio ?? false);
           if (hasAudio && volume > 0) {
             const aFilters: string[] = [
               'aresample=44100',
@@ -582,8 +688,32 @@ export async function renderEditSpec(
         finalAudioLabel = 'aout';
       }
 
+      // Captions (only when a font file is provided in VFS)
+      if (captionFontPath && spec.captions && spec.captions.length > 0) {
+        const fontSize = Math.max(28, Math.round(height * 0.036));
+        for (let i = 0; i < spec.captions.length; i++) {
+          const cap = spec.captions[i];
+          if (maxDuration !== undefined && cap.start >= maxDuration) continue;
+          const endSec =
+            maxDuration !== undefined ? Math.min(cap.end, maxDuration) : cap.end;
+          if (endSec <= cap.start) continue;
+          const yExpr =
+            cap.position === 'center' ? '(h-text_h)/2' : 'h-text_h-80';
+          const escapedText = escapeDrawtext(cap.text);
+          const enableExpr = `between(t,${cap.start.toFixed(3)},${endSec.toFixed(3)})`;
+          filterParts.push(
+            `[${currentVideoLabel}]drawtext=fontfile=${captionFontPath}:text='${escapedText}':fontsize=${fontSize}:fontcolor=white:borderw=3:bordercolor=black@0.85:x=(w-text_w)/2:y=${yExpr}:enable='${enableExpr}'[vcap${i}]`
+          );
+          currentVideoLabel = `vcap${i}`;
+        }
+      }
+
       // Ensure final video format is yuv420p
       filterParts.push(`[${currentVideoLabel}]format=yuv420p[vout]`);
+
+      if (options?.signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
 
       const filterComplex = filterParts.join(';');
       const args: string[] = [
@@ -641,6 +771,10 @@ export async function renderEditSpec(
         exitCode = await ffmpeg.exec(args);
       } finally {
         ffmpeg.off('log', logHandler);
+      }
+
+      if (options?.signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
       }
 
       if (exitCode !== 0) {

@@ -1,5 +1,7 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import type { VideoSpec } from './kit/spec';
+import type { MediaAnalysis } from './media/analyzer';
+import type { EditSpec } from './media/edit-types';
 import type {
   AgentDebugInfo,
   AgentRun,
@@ -9,6 +11,7 @@ import type {
   KitVideoMessage,
   LegacyVideoMessage,
   MediaRecord,
+  MediaVideoMessage,
   NewChatMessage,
   Plan,
   PlanMessage,
@@ -17,7 +20,11 @@ import type {
   VideoSceneRecord,
   VideoType,
 } from './types';
-import { isKitVideoMessage, isLegacyVideoMessage } from './types';
+import {
+  isKitVideoMessage,
+  isLegacyVideoMessage,
+  isMediaVideoMessage,
+} from './types';
 
 export interface UsageLedgerRecord {
   id?: number;
@@ -423,7 +430,11 @@ export async function saveKitVideoVersion(input: {
 
   let maxVersion = 0;
   for (const msg of existing) {
-    if (isKitVideoMessage(msg) || isLegacyVideoMessage(msg)) {
+    if (
+      isKitVideoMessage(msg) ||
+      isLegacyVideoMessage(msg) ||
+      isMediaVideoMessage(msg)
+    ) {
       if (msg.version > maxVersion) {
         maxVersion = msg.version;
       }
@@ -492,6 +503,97 @@ export async function updateKitVideoSpecInPlace(input: {
   };
   await updateMessage(updated);
   return updated;
+}
+
+export async function saveMediaVideoVersion(input: {
+  projectId: string;
+  editSpec: EditSpec;
+  analysis?: MediaAnalysis | null;
+  mediaBlobKey: string;
+  thumbnailMediaKey?: string;
+  durationSec: number;
+  format: VideoFormat;
+  brief: string;
+  usedMediaIds: string[];
+  warnings: string[];
+  routerReason?: string;
+  runId?: string;
+  parentVideoId?: string;
+  debugInfo?: AgentDebugInfo;
+  createdAt?: number;
+  titleHint?: string;
+}): Promise<{
+  createdMediaVideoMessage: MediaVideoMessage;
+  allMessages: ChatMessage[];
+}> {
+  const db = await getDb();
+  const now = input.createdAt ?? Date.now();
+  const tx = db.transaction(['messages', 'projects'], 'readwrite');
+  const msgStore = tx.objectStore('messages');
+  const existing = await msgStore.index('by-projectId').getAll(input.projectId);
+
+  let maxVersion = 0;
+  for (const msg of existing) {
+    if (
+      isKitVideoMessage(msg) ||
+      isLegacyVideoMessage(msg) ||
+      isMediaVideoMessage(msg)
+    ) {
+      if (msg.version > maxVersion) {
+        maxVersion = msg.version;
+      }
+    }
+  }
+
+  const createdMediaVideoMessage: MediaVideoMessage = {
+    id: createDbId(),
+    projectId: input.projectId,
+    createdAt: now,
+    type: 'media_video',
+    version: maxVersion + 1,
+    editSpec: input.editSpec,
+    ...(input.analysis !== undefined ? { analysis: input.analysis } : {}),
+    mediaBlobKey: input.mediaBlobKey,
+    ...(input.thumbnailMediaKey
+      ? { thumbnailMediaKey: input.thumbnailMediaKey }
+      : {}),
+    durationSec: input.durationSec,
+    format: input.format,
+    brief: input.brief,
+    usedMediaIds: input.usedMediaIds,
+    warnings: input.warnings,
+    ...(input.routerReason ? { routerReason: input.routerReason } : {}),
+    ...(input.runId ? { runId: input.runId } : {}),
+    ...(input.parentVideoId ? { parentVideoId: input.parentVideoId } : {}),
+    ...(input.debugInfo ? { debugInfo: input.debugInfo } : {}),
+  };
+
+  await msgStore.put(createdMediaVideoMessage);
+
+  const project = await tx.objectStore('projects').get(input.projectId);
+  if (project) {
+    const nextTitle =
+      project.title === 'New project' ||
+      project.title === 'New chat' ||
+      project.title === 'Untitled chat' ||
+      project.title === 'Untitled video'
+        ? input.titleHint?.trim() || deriveTitleFromMessage(input.brief)
+        : project.title;
+    await tx.objectStore('projects').put({
+      ...project,
+      title: nextTitle,
+      format: input.format,
+      updatedAt: now,
+    });
+  }
+
+  const updatedRows = await msgStore.index('by-projectId').getAll(input.projectId);
+  await tx.done;
+
+  return {
+    createdMediaVideoMessage,
+    allMessages: updatedRows.sort((a, b) => a.createdAt - b.createdAt),
+  };
 }
 
 export async function getRun(id: string): Promise<AgentRun | undefined> {
@@ -654,7 +756,10 @@ export async function saveNewVideoBuildTurn(input: {
         };
         await msgStore.put(superseded);
       }
-    } else if (isKitVideoMessage(msg) && msg.version > maxVersion) {
+    } else if (
+      (isKitVideoMessage(msg) || isMediaVideoMessage(msg)) &&
+      msg.version > maxVersion
+    ) {
       maxVersion = msg.version;
     }
   }

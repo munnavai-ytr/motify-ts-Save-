@@ -3,6 +3,8 @@ import type { AudioSpec } from '@/lib/kit/audio/types';
 import type { AuditReport } from '@/lib/kit/audit/audit';
 import type { Op } from '@/lib/kit/ops';
 import type { VideoSpec } from '@/lib/kit/spec';
+import type { MediaAnalysis } from '@/lib/media/analyzer';
+import type { EditSpec } from '@/lib/media/edit-types';
 
 export type VideoFormat = '9:16' | '16:9' | '1:1';
 
@@ -84,7 +86,14 @@ export interface DebugInfo {
   usageMetadata?: GeminiUsageMetadata;
 }
 
-export type AgentAction = 'reply' | 'ask' | 'create' | 'edit' | 'resume';
+export type AgentAction =
+  | 'reply'
+  | 'ask'
+  | 'create'
+  | 'edit'
+  | 'resume'
+  | 'media'
+  | 'hybrid';
 
 export type RunStatus =
   | 'running'
@@ -154,7 +163,11 @@ export type RunStepId =
   | 'design'
   | 'apply'
   | 'check'
-  | 'save';
+  | 'save'
+  | 'analyze'
+  | 'plan_edit'
+  | 'check_edit'
+  | 'render';
 
 export type RunStepStatus =
   | 'pending'
@@ -193,6 +206,7 @@ export interface AgentRunError {
   retryable: boolean;
   retryPrompt?: string;
   retryAttachments?: AttachmentRef[];
+  retryMedia?: boolean;
 }
 
 export interface AgentDebugInfo {
@@ -323,6 +337,7 @@ export interface ErrorMessage extends BaseMessage {
   retryable: boolean;
   retryPrompt?: string;
   retryAttachments?: AttachmentRef[];
+  retryMedia?: boolean;
   debugInfo?: DebugInfo | AgentDebugInfo;
 }
 
@@ -337,6 +352,7 @@ export interface RunErrorMessage extends BaseMessage {
   retryable: boolean;
   retryPrompt?: string;
   retryAttachments?: AttachmentRef[];
+  retryMedia?: boolean;
   debugInfo?: AgentDebugInfo;
 }
 
@@ -419,6 +435,24 @@ export interface KitVideoMessage extends BaseMessage {
   debugInfo?: AgentDebugInfo;
 }
 
+export interface MediaVideoMessage extends BaseMessage {
+  type: 'media_video';
+  version: number;
+  editSpec: EditSpec;
+  analysis?: MediaAnalysis | null;
+  mediaBlobKey: string;
+  thumbnailMediaKey?: string;
+  durationSec: number;
+  format: VideoFormat;
+  brief: string;
+  usedMediaIds: string[];
+  warnings: string[];
+  routerReason?: string;
+  runId?: string;
+  parentVideoId?: string;
+  debugInfo?: AgentDebugInfo;
+}
+
 /** Alias kept for legacy components until M5 cleanup. */
 export type VideoMessage = LegacyVideoMessage;
 
@@ -442,6 +476,7 @@ export type ChatMessage =
   | RunErrorMessage
   | LegacyVideoMessage
   | KitVideoMessage
+  | MediaVideoMessage
   | ReservedSceneCodeMessage
   | ReservedRenderResultMessage;
 
@@ -461,8 +496,15 @@ export function isLegacyVideoMessage(
   return msg.type === 'video' && 'scenes' in msg;
 }
 
+export function isMediaVideoMessage(
+  msg: ChatMessage
+): msg is MediaVideoMessage {
+  return msg.type === 'media_video';
+}
+
 export function isErrorLikeMessage(
   msg: ChatMessage
 ): msg is ErrorMessage | RunErrorMessage {
   return msg.type === 'error' || msg.type === 'run_error';
 }
+

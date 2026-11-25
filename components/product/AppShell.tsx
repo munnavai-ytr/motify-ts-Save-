@@ -14,9 +14,15 @@ import { useVisualViewportHeight } from '@/hooks/use-visual-viewport';
 import { buildMultimodalTurnParts } from '@/lib/agent/context';
 import { isBengaliText, isBuildIntent } from '@/lib/agent/intent';
 import {
+  runMediaTurn,
+  type MediaUsageDelta,
+} from '@/lib/agent/media-executor';
+import { routeTurn, type RouteTurnResult } from '@/lib/agent/media-router';
+import {
   appendRunSubNote,
   appendStepSubNote,
   createAgentRun,
+  createMediaAgentRun,
   loadProjectRuns,
   normalizeInterruptedRuns,
   persistRun,
@@ -30,6 +36,7 @@ import {
 } from '@/lib/ai/animator';
 import { runDirectorTurn } from '@/lib/ai/director';
 import { isAbortError } from '@/lib/ai/gemini-client';
+import { GeminiRequestError } from '@/lib/ai/gemini-errors';
 import { applyOpsToPlan } from '@/lib/ai/plan-edit';
 import { validatePlanTotalDuration } from '@/lib/ai/plan-schema';
 import { compileComponent, type CompiledComponentType } from '@/lib/compile';
@@ -44,8 +51,11 @@ import {
   deriveTitleFromMessage,
   getMediaRecordsByIds,
   listMessages,
+  listProjectMedia,
   listProjectsWithMessageCounts,
+  putMediaRecord,
   putMediaRecords,
+  saveMediaVideoVersion,
   saveNewVideoBuildTurn,
   savePlanTurn,
   updateKitVideoSpecInPlace,
@@ -58,6 +68,8 @@ import {
   type KitHistoryController,
 } from '@/lib/kit/history';
 import { applyOps } from '@/lib/kit/ops';
+import { isOutOfMemoryError } from '@/lib/media/compositor';
+import { terminateFFmpeg } from '@/lib/media/ffmpeg-loader';
 import {
   clearStoredBackupModel,
   clearStoredModel,
@@ -69,6 +81,7 @@ import {
   getStoredDefaultFormat,
   getStoredModel,
   getStoredProjectFormat,
+  getStoredUseMedia,
   setStoredActiveProjectId,
   setStoredProjectFormat,
 } from '@/lib/storage';
@@ -83,17 +96,23 @@ import type {
   KitVideoMessage,
   LegacyVideoMessage,
   MediaRecord,
+  MediaVideoMessage,
   PlanMessage,
   Project,
   QueuedMessageDraft,
   RunErrorMessage,
+  RunStepId,
   SessionUsage,
   UserTextMessage,
   VideoMessage,
   VideoSceneRecord,
   VideoStatus,
 } from '@/lib/types';
-import { isKitVideoMessage, isLegacyVideoMessage } from '@/lib/types';
+import {
+  isKitVideoMessage,
+  isLegacyVideoMessage,
+  isMediaVideoMessage,
+} from '@/lib/types';
 import {
   buildSceneTheme,
   computeSceneSpecHash,
@@ -211,6 +230,9 @@ function WorkspaceShell() {
   const [autoBuild, setAutoBuild] = useState<boolean>(() =>
     typeof window !== 'undefined' ? getStoredAutoBuild() : true
   );
+  const [useMedia, setUseMedia] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? getStoredUseMedia() : true
+  );
   const [defaultFormat, setDefaultFormat] = useState<FormatPreference>(() =>
     typeof window !== 'undefined' ? getStoredDefaultFormat() : 'auto'
   );
@@ -294,6 +316,7 @@ function WorkspaceShell() {
       videoAbortControllerRef.current.abort();
       videoAbortControllerRef.current = null;
     }
+    terminateFFmpeg();
     setThinkingStartedAt(null);
     setActiveRun((prev) => {
       if (prev) {
@@ -608,6 +631,17 @@ function WorkspaceShell() {
     ) => Promise<void>) | null
   >(null);
 
+  const executeMediaTurnRef = useRef<
+    ((
+      targetProject: Project,
+      conversationMessages: ChatMessage[],
+      userPrompt: string,
+      newMediaRecords: MediaRecord[],
+      userMessageId: string,
+      route: RouteTurnResult
+    ) => Promise<void>) | null
+  >(null);
+
   const startVideoBuildRef = useRef<
     ((
       targetProject: Project,
@@ -709,9 +743,20 @@ function WorkspaceShell() {
               m.type === 'plan' && m.status !== 'superseded'
           ) ?? null;
 
+      const latestMediaVideoMsg =
+        [...existingMessages]
+          .reverse()
+          .find((m): m is MediaVideoMessage => isMediaVideoMessage(m)) ?? null;
+
+      const planIsFresherThanMedia =
+        latestActivePlanMsg !== null &&
+        (!latestMediaVideoMsg ||
+          latestActivePlanMsg.createdAt >= latestMediaVideoMsg.createdAt);
+
       if (
         fullMediaRecords.length === 0 &&
         !content.includes('?') &&
+        planIsFresherThanMedia &&
         isBuildIntent(
           content,
           latestActivePlanMsg ? latestActivePlanMsg.plan : null
@@ -756,15 +801,43 @@ function WorkspaceShell() {
         return true;
       }
 
-      if (executeDirectorTurnRef.current) {
-        void executeDirectorTurnRef.current(
-          targetProject,
-          existingMessages,
-          content,
-          fullMediaRecords,
-          userMsg.id
-        );
-      }
+      const targetProjectCaptured = targetProject;
+      void (async () => {
+        const route = await routeTurn({
+          userText: content,
+          currentAttachments: attachmentRefs,
+          messages: existingMessages,
+          useMediaEnabled: useMedia,
+          apiKey: effectiveApiKey,
+          modelName: effectiveModel,
+          backupModelName: effectiveBackupModel || undefined,
+        });
+
+        if (route.route === 'media' || route.route === 'hybrid') {
+          if (executeMediaTurnRef.current) {
+            await executeMediaTurnRef.current(
+              targetProjectCaptured,
+              updatedHistory,
+              content,
+              fullMediaRecords,
+              userMsg.id,
+              route
+            );
+          }
+          return;
+        }
+
+        if (executeDirectorTurnRef.current) {
+          await executeDirectorTurnRef.current(
+            targetProjectCaptured,
+            existingMessages,
+            content,
+            fullMediaRecords,
+            userMsg.id
+          );
+        }
+      })();
+
       return true;
     },
     [
@@ -772,10 +845,12 @@ function WorkspaceShell() {
       defaultFormat,
       draftFormatOverride,
       effectiveApiKey,
+      effectiveBackupModel,
       effectiveModel,
       messages,
       refreshProjectsList,
       showToast,
+      useMedia,
     ]
   );
 
@@ -1419,6 +1494,469 @@ function WorkspaceShell() {
     executeDirectorTurnRef.current = executeDirectorTurn;
   }, [executeDirectorTurn]);
 
+  const executeMediaTurn = useCallback(
+    async (
+      targetProject: Project,
+      conversationMessages: ChatMessage[],
+      userPrompt: string,
+      newMediaRecords: MediaRecord[],
+      userMessageId: string,
+      route: RouteTurnResult
+    ) => {
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      setThinkingStartedAt(Date.now());
+
+      const existingMediaVideo = route.targetMediaVideoId
+        ? conversationMessages.find(
+            (m): m is MediaVideoMessage =>
+              isMediaVideoMessage(m) && m.id === route.targetMediaVideoId
+          ) ?? null
+        : [...conversationMessages]
+            .reverse()
+            .find((m): m is MediaVideoMessage => isMediaVideoMessage(m)) ?? null;
+
+      const skipAnalyze =
+        route.editExisting &&
+        newMediaRecords.length === 0 &&
+        Boolean(existingMediaVideo?.analysis);
+
+      let currentRun = createMediaAgentRun({
+        projectId: targetProject.id,
+        userMessageId,
+        userPrompt,
+        action: route.route === 'hybrid' ? 'hybrid' : 'media',
+        skipAnalyze,
+        includeHybrid: route.route === 'hybrid',
+        modelName: effectiveModel,
+        requestedModelName: effectiveModel,
+      });
+
+      if (route.usage) {
+        currentRun = {
+          ...currentRun,
+          modelName: route.usage.modelName ?? currentRun.modelName,
+          usedBackupModel: Boolean(route.usage.usedBackup),
+          usage: {
+            requests: currentRun.usage.requests + route.usage.requests,
+            promptTokens:
+              currentRun.usage.promptTokens + route.usage.promptTokens,
+            outputTokens:
+              currentRun.usage.outputTokens + route.usage.outputTokens,
+            thoughtTokens:
+              currentRun.usage.thoughtTokens + route.usage.thoughtTokens,
+          },
+        };
+        setSessionUsage((prev) => ({
+          requestsMade: prev.requestsMade + (route.usage?.requests ?? 0),
+          promptTokens: prev.promptTokens + (route.usage?.promptTokens ?? 0),
+          outputTokens: prev.outputTokens + (route.usage?.outputTokens ?? 0),
+          thoughtTokens:
+            (prev.thoughtTokens ?? 0) + (route.usage?.thoughtTokens ?? 0),
+        }));
+      }
+
+      currentRun = withStepStatus(currentRun, 'understand', 'done');
+      currentRun = appendStepSubNote(currentRun, 'understand', route.reason);
+
+      const updateLiveRun = (mutator: (prev: AgentRun) => AgentRun) => {
+        currentRun = mutator(currentRun);
+        if (
+          !controller.signal.aborted &&
+          activeProjectIdRef.current === targetProject.id
+        ) {
+          setActiveRun(currentRun);
+        }
+      };
+
+      setActiveRun(currentRun);
+
+      // Post short intro message so user immediately sees what engine is running
+      const useBengali = isBengaliText(userPrompt);
+      const hasAudioInNew = newMediaRecords.some((m) => m.kind === 'audio');
+      const introContent = useBengali
+        ? route.route === 'hybrid'
+          ? 'আপনার ভিডিও ও মোশন গ্রাফিক্স মিলিয়ে এডিট করছি…'
+          : route.editExisting
+            ? 'আপনার আগের এডিটটি আপডেট করছি…'
+            : 'আপনার মিডিয়া দিয়ে ভিডিও এডিট শুরু করছি…'
+        : route.route === 'hybrid'
+          ? 'Combining your footage with motion graphics. Editing now…'
+          : route.editExisting
+            ? 'Updating your media edit…'
+            : hasAudioInNew
+              ? 'Using your clips & audio. Editing now…'
+              : 'Using your uploaded media. Editing now…';
+
+      let introMsg: AssistantTextMessage | null = null;
+      let turnSucceeded = false;
+
+      try {
+        introMsg = (await addMessage({
+          projectId: targetProject.id,
+          type: 'assistant_text',
+          content: introContent,
+          createdAt: Date.now(),
+        })) as AssistantTextMessage;
+
+        if (activeProjectIdRef.current === targetProject.id) {
+          setMessages((prev) => [...prev, introMsg!]);
+        }
+
+        // Gather user media records (filter out prior rendered MP4 outputs/thumbnails)
+        const renderedArtifactIds = new Set<string>();
+        for (const m of conversationMessages) {
+          if (isMediaVideoMessage(m)) {
+            renderedArtifactIds.add(m.mediaBlobKey);
+            if (m.thumbnailMediaKey) {
+              renderedArtifactIds.add(m.thumbnailMediaKey);
+            }
+          }
+        }
+
+        let combinedRecords: MediaRecord[] = [...newMediaRecords];
+        if (route.editExisting || combinedRecords.length === 0) {
+          const allProjectMedia = await listProjectMedia(targetProject.id);
+          const priorInputs = allProjectMedia.filter(
+            (rec) => !renderedArtifactIds.has(rec.id)
+          );
+          const seen = new Set<string>();
+          const merged: MediaRecord[] = [];
+          for (const rec of [...priorInputs, ...newMediaRecords]) {
+            if (!seen.has(rec.id)) {
+              seen.add(rec.id);
+              merged.push(rec);
+            }
+          }
+          combinedRecords = merged;
+        }
+
+        throwIfAborted: if (controller.signal.aborted) {
+          break throwIfAborted;
+        }
+
+        const resolvedTurnFormat =
+          getStoredProjectFormat(targetProject.id) ??
+          targetProject.format ??
+          defaultFormat;
+
+        const mediaResult = await runMediaTurn({
+          userPrompt,
+          mediaRecords: combinedRecords,
+          newAttachmentCount: newMediaRecords.length,
+          format: resolvedTurnFormat,
+          language: useBengali ? 'bn' : 'en',
+          apiKey: effectiveApiKey,
+          modelName: effectiveModel,
+          backupModelName: effectiveBackupModel || undefined,
+          route,
+          existingMediaVideo,
+          signal: controller.signal,
+          onStep: (stepId: RunStepId, status, detail, label) => {
+            updateLiveRun((r) =>
+              withStepStatus(r, stepId, status, detail, label)
+            );
+          },
+          onSubNote: (stepId, note) => {
+            updateLiveRun((r) =>
+              stepId ? appendStepSubNote(r, stepId, note) : appendRunSubNote(r, note)
+            );
+          },
+          onUsage: (delta: MediaUsageDelta) => {
+            if (!controller.signal.aborted) {
+              updateLiveRun((r) => ({
+                ...r,
+                modelName: delta.modelName,
+                usedBackupModel: r.usedBackupModel || delta.usedBackup,
+                usage: {
+                  requests: r.usage.requests + delta.requestsMade,
+                  promptTokens: r.usage.promptTokens + delta.promptTokens,
+                  outputTokens: r.usage.outputTokens + delta.outputTokens,
+                  thoughtTokens: r.usage.thoughtTokens + delta.thoughtTokens,
+                },
+              }));
+            }
+            setSessionUsage((prev) => ({
+              requestsMade: prev.requestsMade + delta.requestsMade,
+              promptTokens: prev.promptTokens + delta.promptTokens,
+              outputTokens: prev.outputTokens + delta.outputTokens,
+              thoughtTokens: (prev.thoughtTokens ?? 0) + delta.thoughtTokens,
+            }));
+          },
+          onStatus: (ev) => {
+            if (!ev || controller.signal.aborted) return;
+            if (ev.type === 'attempt') {
+              updateLiveRun((r) => ({
+                ...r,
+                modelName: ev.model,
+                usedBackupModel: r.usedBackupModel || ev.isBackup,
+              }));
+            } else if (ev.type === 'waiting') {
+              const reasonLabel =
+                ev.reasonKind === 'quota_minute'
+                  ? 'Rate limit reached — waiting to retry'
+                  : ev.reasonKind === 'overloaded'
+                    ? 'Google was busy — waiting to retry'
+                    : 'Request timed out — retrying';
+              updateLiveRun((r) => appendRunSubNote(r, reasonLabel));
+            } else if (ev.type === 'fallback') {
+              updateLiveRun((r) => {
+                const withNote = appendRunSubNote(
+                  r,
+                  'Google was busy, switched to the backup model'
+                );
+                return {
+                  ...withNote,
+                  modelName: ev.toModel,
+                  usedBackupModel: true,
+                };
+              });
+            }
+          },
+        });
+
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        updateLiveRun((r) => withStepStatus(r, 'save', 'running'));
+
+        const mp4MediaId = createDbId();
+        await putMediaRecord({
+          id: mp4MediaId,
+          projectId: targetProject.id,
+          kind: 'video',
+          name: `motionai-edit-${Date.now()}.mp4`,
+          mime: 'video/mp4',
+          size: mediaResult.mp4Blob.size,
+          createdAt: Date.now(),
+          blob: mediaResult.mp4Blob,
+          duration: mediaResult.durationSec,
+        });
+
+        let thumbMediaId: string | undefined;
+        if (mediaResult.thumbBlob) {
+          thumbMediaId = createDbId();
+          await putMediaRecord({
+            id: thumbMediaId,
+            projectId: targetProject.id,
+            kind: 'image',
+            name: `motionai-edit-thumb-${Date.now()}.jpg`,
+            mime: 'image/jpeg',
+            size: mediaResult.thumbBlob.size,
+            createdAt: Date.now(),
+            blob: mediaResult.thumbBlob,
+          });
+        }
+
+        const finalizedRun = withRunFinalState(
+          withStepStatus(
+            {
+              ...currentRun,
+              modelName: mediaResult.modelName,
+              usedBackupModel: mediaResult.usedBackupModel,
+              artifacts: {
+                ...currentRun.artifacts,
+                brief: mediaResult.brief,
+                warnings: mediaResult.warnings,
+              },
+            },
+            'save',
+            'done'
+          ),
+          { status: 'done' }
+        );
+        currentRun = finalizedRun;
+        await persistRun(finalizedRun);
+        setRunsById((prev) => ({
+          ...prev,
+          [finalizedRun.id]: finalizedRun,
+        }));
+
+        const agentDebugInfo: AgentDebugInfo = {
+          runId: finalizedRun.id,
+          action: finalizedRun.action,
+          modelName: mediaResult.modelName,
+          requestedModelName: effectiveModel,
+          usedBackupModel: mediaResult.usedBackupModel,
+          requests: finalizedRun.usage.requests || mediaResult.calls,
+          tokens: {
+            prompt: finalizedRun.usage.promptTokens,
+            output: finalizedRun.usage.outputTokens,
+            thinking: finalizedRun.usage.thoughtTokens,
+          },
+          elapsedMs: Date.now() - finalizedRun.createdAt,
+          timestamp: new Date().toISOString(),
+          warnings: mediaResult.warnings,
+        };
+
+        const updatedIntro: AssistantTextMessage = {
+          ...introMsg,
+          runId: finalizedRun.id,
+          debugInfo: agentDebugInfo,
+        };
+        await updateMessage(updatedIntro);
+
+        const { allMessages } = await saveMediaVideoVersion({
+          projectId: targetProject.id,
+          editSpec: mediaResult.editSpec,
+          analysis: mediaResult.analysis,
+          mediaBlobKey: mp4MediaId,
+          thumbnailMediaKey: thumbMediaId,
+          durationSec: mediaResult.durationSec,
+          format: mediaResult.format,
+          brief: mediaResult.brief,
+          usedMediaIds: mediaResult.usedMediaIds,
+          warnings: mediaResult.warnings,
+          routerReason: route.reason,
+          runId: finalizedRun.id,
+          parentVideoId: existingMediaVideo?.id,
+          debugInfo: agentDebugInfo,
+          createdAt: Math.max(Date.now(), introMsg.createdAt + 1),
+        });
+
+        setStoredProjectFormat(targetProject.id, mediaResult.format);
+        if (activeProjectIdRef.current === targetProject.id) {
+          setActiveProjectFormatPref(mediaResult.format);
+          setMessages(allMessages);
+        }
+        await refreshProjectsList();
+        turnSucceeded = true;
+      } catch (err: unknown) {
+        if (isAbortError(err) || controller.signal.aborted) {
+          return;
+        }
+        terminateFFmpeg();
+
+        const isGeminiErr = err instanceof GeminiRequestError;
+        const oom = isOutOfMemoryError(err);
+        const summary = isGeminiErr
+          ? err.message
+          : oom
+            ? 'The browser ran out of memory while editing. Try fewer or shorter clips.'
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        const userAction = isGeminiErr
+          ? err.userAction
+          : oom
+            ? 'Try trimming clips shorter or attaching fewer clips, then retry.'
+            : 'Review your clips or edit instructions and retry.';
+        const details = isGeminiErr
+          ? err.rawDetails || err.explanation
+          : err instanceof Error
+            ? err.stack || err.message
+            : String(err);
+
+        const retryAttachments = newMediaRecords.map((m) => ({
+          mediaId: m.id,
+          kind: m.kind,
+          name: m.name,
+          mime: m.mime,
+          size: m.size,
+          width: m.width,
+          height: m.height,
+          duration: m.duration,
+        }));
+
+        const failedRun = withRunFinalState(currentRun, {
+          status: 'failed',
+          error: {
+            summary,
+            userAction,
+            errorKind: isGeminiErr ? err.kind : undefined,
+            needsBackupModel:
+              isGeminiErr &&
+              err.kind === 'model_not_found' &&
+              !effectiveBackupModel,
+            details,
+            retryable: isGeminiErr ? err.retryable : true,
+            retryPrompt: userPrompt,
+            retryAttachments,
+            retryMedia: true,
+          },
+        });
+        await persistRun(failedRun);
+        setRunsById((prev) => ({ ...prev, [failedRun.id]: failedRun }));
+
+        if (introMsg) {
+          const updatedIntro: AssistantTextMessage = {
+            ...introMsg,
+            runId: failedRun.id,
+          };
+          await updateMessage(updatedIntro);
+          if (activeProjectIdRef.current === targetProject.id) {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === updatedIntro.id ? updatedIntro : m))
+            );
+          }
+        }
+
+        const errorMsg = await addMessage({
+          projectId: targetProject.id,
+          type: 'error',
+          runId: failedRun.id,
+          summary,
+          userAction,
+          errorKind: isGeminiErr ? err.kind : undefined,
+          needsBackupModel:
+            isGeminiErr &&
+            err.kind === 'model_not_found' &&
+            !effectiveBackupModel,
+          details,
+          retryable: isGeminiErr ? err.retryable : true,
+          retryPrompt: userPrompt,
+          retryAttachments,
+          retryMedia: true,
+        });
+        if (activeProjectIdRef.current === targetProject.id) {
+          setMessages((prev) => [...prev, errorMsg]);
+        }
+        await refreshProjectsList();
+      } finally {
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
+          setThinkingStartedAt(null);
+          setActiveRun(null);
+
+          if (turnSucceeded) {
+            const pendingQueue = queuedDraftsRef.current;
+            const nextQueued = pendingQueue.find((d) => d.status === 'queued');
+            if (nextQueued) {
+              setQueuedDrafts((prev) =>
+                prev.filter((d) => d.id !== nextQueued.id)
+              );
+              window.setTimeout(() => {
+                void dispatchUserTurnImmediate(
+                  nextQueued.text,
+                  nextQueued.attachments
+                );
+              }, 0);
+            }
+          } else {
+            setQueuedDrafts((prev) =>
+              prev.map((d) =>
+                d.status === 'queued' ? { ...d, status: 'paused_failed' } : d
+              )
+            );
+          }
+        }
+      }
+    },
+    [
+      defaultFormat,
+      dispatchUserTurnImmediate,
+      effectiveApiKey,
+      effectiveBackupModel,
+      effectiveModel,
+      refreshProjectsList,
+    ]
+  );
+
+  useEffect(() => {
+    executeMediaTurnRef.current = executeMediaTurn;
+  }, [executeMediaTurn]);
+
   const handleSendMessage = async (
     content: string,
     attachments: Array<Omit<MediaRecord, 'projectId'>>
@@ -1514,6 +2052,26 @@ function WorkspaceShell() {
         attachmentIds.length > 0
           ? await getMediaRecordsByIds(attachmentIds)
           : [];
+      const route = await routeTurn({
+        userText: userMsg.content,
+        currentAttachments: userMsg.attachments ?? [],
+        messages: historyPrior,
+        useMediaEnabled: useMedia,
+        apiKey: effectiveApiKey,
+        modelName: effectiveModel,
+        backupModelName: effectiveBackupModel || undefined,
+      });
+      if (route.route === 'media' || route.route === 'hybrid') {
+        await executeMediaTurn(
+          activeProject,
+          [...historyPrior, userMsg],
+          userMsg.content,
+          mediaRecords,
+          userMsg.id,
+          route
+        );
+        return;
+      }
       await executeDirectorTurn(
         activeProject,
         historyPrior,
@@ -1567,6 +2125,40 @@ function WorkspaceShell() {
             (m): m is PlanMessage =>
               m.type === 'plan' && m.status !== 'superseded'
           ) ?? null;
+
+      if (errorMessage.retryMedia) {
+        const route = await routeTurn({
+          userText: retryPromptText,
+          currentAttachments: errorMessage.retryAttachments ?? [],
+          messages: messagesWithoutError,
+          useMediaEnabled: useMedia,
+          apiKey: effectiveApiKey,
+          modelName: effectiveModel,
+          backupModelName: effectiveBackupModel || undefined,
+        });
+        const forcedRoute: RouteTurnResult =
+          route.route === 'media' || route.route === 'hybrid'
+            ? route
+            : {
+                route: 'media',
+                reason: 'Retrying failed media edit.',
+                useFootage: true,
+                referenceOnly: false,
+                editExisting: mediaRecords.length === 0,
+                referenceMediaIds: [],
+                usedAiClassifier: false,
+              };
+        await executeMediaTurn(
+          activeProject,
+          messagesWithoutError,
+          retryPromptText,
+          mediaRecords,
+          createDbId(),
+          forcedRoute
+        );
+        return;
+      }
+
       if (
         mediaRecords.length === 0 &&
         !retryPromptText.includes('?') &&
@@ -1585,6 +2177,28 @@ function WorkspaceShell() {
         }
         return;
       }
+
+      const route = await routeTurn({
+        userText: retryPromptText,
+        currentAttachments: errorMessage.retryAttachments ?? [],
+        messages: messagesWithoutError,
+        useMediaEnabled: useMedia,
+        apiKey: effectiveApiKey,
+        modelName: effectiveModel,
+        backupModelName: effectiveBackupModel || undefined,
+      });
+      if (route.route === 'media' || route.route === 'hybrid') {
+        await executeMediaTurn(
+          activeProject,
+          messagesWithoutError,
+          retryPromptText,
+          mediaRecords,
+          createDbId(),
+          route
+        );
+        return;
+      }
+
       await executeDirectorTurn(
         activeProject,
         messagesWithoutError,
@@ -2688,6 +3302,7 @@ function WorkspaceShell() {
               onRetryAssistantTurn={handleRetryAssistantTurn}
               onRetryError={handleRetryError}
               onUndoEdit={(id) => void handleUndoEdit(id)}
+              onRequestMediaEdit={() => setFocusComposerSignal((n) => n + 1)}
               hasBackupModel={Boolean(effectiveBackupModel)}
               onOpenSettings={() => setSettingsOpen(true)}
               formatPreference={composerFormat}
@@ -2736,6 +3351,8 @@ function WorkspaceShell() {
         models={models}
         autoBuild={autoBuild}
         onAutoBuildChange={setAutoBuild}
+        useMedia={useMedia}
+        onUseMediaChange={setUseMedia}
         defaultFormat={defaultFormat}
         onDefaultFormatChange={setDefaultFormat}
         sessionUsage={sessionUsage}
