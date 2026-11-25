@@ -118,6 +118,75 @@ export const EditSpecSchema = z.object({
   tracks: z.array(TrackSchema).min(1, 'EditSpec must include at least one track'),
 });
 
+export const EDIT_SPEC_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'OBJECT',
+  required: ['v', 'format', 'fps', 'totalSeconds', 'tracks'],
+  properties: {
+    v: { type: 'INTEGER', nullable: false },
+    format: {
+      type: 'STRING',
+      enum: [...EDIT_FORMATS],
+      nullable: false,
+    },
+    fps: { type: 'INTEGER', nullable: false },
+    totalSeconds: { type: 'NUMBER', nullable: false },
+    colorGrade: {
+      type: 'STRING',
+      enum: [...COLOR_GRADES],
+      nullable: true,
+    },
+    tracks: {
+      type: 'ARRAY',
+      nullable: false,
+      items: {
+        type: 'OBJECT',
+        required: ['kind', 'startAt'],
+        properties: {
+          kind: {
+            type: 'STRING',
+            enum: ['video', 'audio', 'overlay', 'mg'],
+            nullable: false,
+          },
+          mediaId: { type: 'STRING', nullable: true },
+          startAt: { type: 'NUMBER', nullable: false },
+          inPoint: { type: 'NUMBER', nullable: true },
+          outPoint: { type: 'NUMBER', nullable: true },
+          volume: { type: 'NUMBER', nullable: true },
+          speed: { type: 'NUMBER', nullable: true },
+          colorGrade: { type: 'STRING', nullable: true },
+          fadeIn: { type: 'NUMBER', nullable: true },
+          fadeOut: { type: 'NUMBER', nullable: true },
+          loop: { type: 'BOOLEAN', nullable: true },
+          duration: { type: 'NUMBER', nullable: true },
+          x: {
+            type: 'STRING',
+            enum: [...OVERLAY_X_POSITIONS],
+            nullable: true,
+          },
+          y: {
+            type: 'STRING',
+            enum: [...OVERLAY_Y_POSITIONS],
+            nullable: true,
+          },
+          scale: { type: 'NUMBER', nullable: true },
+          opacity: { type: 'NUMBER', nullable: true },
+          shadow: { type: 'BOOLEAN', nullable: true },
+          border: {
+            type: 'OBJECT',
+            nullable: true,
+            required: ['color', 'width'],
+            properties: {
+              color: { type: 'STRING', nullable: false },
+              width: { type: 'NUMBER', nullable: false },
+            },
+          },
+          specJson: { type: 'STRING', nullable: true },
+        },
+      },
+    },
+  },
+};
+
 export type VideoTrack = z.infer<typeof VideoTrackSchema>;
 export type AudioTrack = z.infer<typeof AudioTrackSchema>;
 export type OverlayBorder = z.infer<typeof OverlayBorderSchema>;

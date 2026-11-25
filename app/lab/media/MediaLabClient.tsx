@@ -25,7 +25,9 @@ import {
   Sparkles,
   Trash2,
   Upload,
+  Wand2,
 } from 'lucide-react';
+import { AiDirectorTab } from './AiDirectorTab';
 import {
   COLOR_GRADE_CURVES,
   extractFrames,
@@ -57,6 +59,7 @@ import { formatBytes } from '@/lib/media/process';
 import { useMediaPreview } from '@/lib/media/useMediaPreview';
 
 type LabMediaKind = 'video' | 'image' | 'audio';
+type LabTab = 'tools' | 'ai-director';
 
 interface UploadedMediaItem {
   id: string;
@@ -195,6 +198,7 @@ export function MediaLabClient() {
   const isClient = envSnapshot !== 'ssr';
   const hasSharedArrayBuffer = envSnapshot.startsWith('1:');
   const isCrossOriginIsolated = envSnapshot.endsWith(':1');
+  const [activeTab, setActiveTab] = useState<LabTab>('tools');
 
   // Section A: FFmpeg Loader State
   const [loadState, setLoadState] = useState<FFmpegLoadState>(() =>
@@ -859,32 +863,77 @@ export function MediaLabClient() {
   return (
     <div className="min-h-screen bg-[#0B0F17] text-slate-100 overflow-x-hidden">
       <header className="border-b border-slate-800/90 bg-[#0B0F17]/95 sticky top-0 z-20 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-3 py-3.5 sm:px-6">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-3 py-3.5 sm:px-6">
           <div className="min-w-0">
             <h1 className="text-base sm:text-lg font-bold tracking-tight text-slate-100 truncate">
-              FFmpeg.wasm Media Lab (Stage V1)
+              FFmpeg.wasm Media Lab
             </h1>
             <p className="text-xs text-slate-400 truncate">
-              Client-side WebAssembly compositor, probe, frame extraction &amp; EditSpec runner
+              Client-side WebAssembly compositor, Gemini vision analyzer &amp; AI Edit Director
             </p>
           </div>
-          <span
-            className={`shrink-0 rounded-md px-2.5 py-1 text-xs font-medium border ${
-              loadState === 'ready'
-                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                : loadState === 'loading'
-                  ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
-                  : loadState === 'error'
-                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                    : 'border-slate-700 bg-slate-800/70 text-slate-300'
-            }`}
-          >
-            FFmpeg: {loadState}
-          </span>
+          <div className="flex items-center gap-2.5">
+            <div
+              role="tablist"
+              aria-label="Media Lab Sections"
+              className="inline-flex items-center rounded-lg border border-slate-800 bg-slate-900 p-0.5 text-xs"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'tools'}
+                onClick={() => setActiveTab('tools')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-colors ${
+                  activeTab === 'tools'
+                    ? 'bg-sky-600 text-white'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                <Scissors className="h-3.5 w-3.5" />
+                Tools
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === 'ai-director'}
+                onClick={() => setActiveTab('ai-director')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 font-medium transition-colors ${
+                  activeTab === 'ai-director'
+                    ? 'bg-sky-600 text-white'
+                    : 'text-slate-300 hover:text-white'
+                }`}
+              >
+                <Wand2 className="h-3.5 w-3.5" />
+                AI Director
+              </button>
+            </div>
+            <span
+              className={`shrink-0 rounded-md px-2.5 py-1 text-xs font-medium border ${
+                loadState === 'ready'
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : loadState === 'loading'
+                    ? 'border-sky-500/40 bg-sky-500/10 text-sky-300'
+                    : loadState === 'error'
+                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                      : 'border-slate-700 bg-slate-800/70 text-slate-300'
+              }`}
+            >
+              FFmpeg: {loadState}
+            </span>
+          </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 px-3 py-6 sm:px-6">
+        <div className={activeTab === 'ai-director' ? 'space-y-6' : 'hidden'}>
+          <AiDirectorTab
+            mediaItems={mediaItems}
+            mediaBlobsMap={mediaBlobsMap}
+            onGoToTools={() => setActiveTab('tools')}
+          />
+        </div>
+
+        <div className={activeTab === 'tools' ? 'space-y-6' : 'hidden'}>
         {/* SECTION A: FFMPEG STATUS */}
         <section className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 sm:p-5 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1602,6 +1651,7 @@ export function MediaLabClient() {
             </div>
           )}
         </section>
+        </div>
       </main>
     </div>
   );
