@@ -12,11 +12,13 @@ import { EDIT_DIRECTOR_PROMPT } from './edit-director-prompt';
 import {
   COLOR_GRADES,
   EDIT_SPEC_JSON_SCHEMA,
+  fillTrackDefaults,
   MAX_TIMELINE_SECONDS,
   normalizeEditSpec,
   type ColorGradePreset,
   type EditFormat,
   type EditSpec,
+  type MediaMetaEntry,
 } from './edit-types';
 
 export interface MediaItem {
@@ -135,13 +137,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function hasStyleKeyword(text: string): boolean {
-  const lower = text.toLowerCase();
   return STYLE_KEYWORDS.some((kw) => {
-    if (/[\u0980-\u09FF]/.test(kw)) {
-      return lower.includes(kw);
-    }
     const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\b${escaped}\\b`, 'i').test(lower);
+    return new RegExp(
+      `(?<![\\p{L}\\p{M}\\p{N}_])${escaped}(?![\\p{L}\\p{M}\\p{N}_])`,
+      'iu'
+    ).test(text);
   });
 }
 
@@ -506,13 +507,29 @@ export async function generateEditSpec(
   });
   addUsageTokens(tokens, firstRes.usageMetadata);
 
-  const evaluateOutput = (rawText: string): {
+  const mediaMeta: Record<string, MediaMetaEntry> = {};
+  input.mediaItems.forEach((item, idx) => {
+    const normalizedKind: MediaMetaEntry['kind'] =
+      item.kind === 'video' || item.kind === 'image' || item.kind === 'audio'
+        ? item.kind
+        : 'file';
+    mediaMeta[resolveMediaId(item, idx)] = {
+      kind: normalizedKind,
+      duration: item.duration,
+    };
+  });
+
+  interface EvaluatedEditOutput {
     ok: boolean;
     spec?: EditSpec;
     brief?: string;
     warnings?: string[];
     errors: string[];
-  } => {
+    filledSpecCandidate?: Record<string, unknown>;
+    invalidTrackIndices?: number[];
+  }
+
+  const evaluateOutput = (rawText: string): EvaluatedEditOutput => {
     let parsed: unknown;
     try {
       parsed = extractJsonFromText(rawText);
@@ -526,9 +543,24 @@ export async function generateEditSpec(
     }
 
     const { brief, specCandidate } = extractBriefAndSpecInput(parsed);
-    const normalized = normalizeEditSpec(specCandidate);
+    const filled = fillTrackDefaults(specCandidate, mediaMeta);
+    const filledRecord = isRecord(filled.rawSpec) ? filled.rawSpec : undefined;
+    const normalized = normalizeEditSpec(filled.rawSpec);
     if (!normalized.ok) {
-      return { ok: false, errors: normalized.errors };
+      const invalidIndices = new Set<number>();
+      for (const msg of normalized.errors) {
+        const match = /^tracks\.(\d+)\./.exec(msg);
+        if (match) {
+          invalidIndices.add(Number(match[1]));
+        }
+      }
+      return {
+        ok: false,
+        brief,
+        errors: normalized.errors,
+        filledSpecCandidate: filledRecord,
+        invalidTrackIndices: Array.from(invalidIndices).sort((a, b) => a - b),
+      };
     }
 
     const mediaErrors = validateAgainstMediaItems(
@@ -537,14 +569,27 @@ export async function generateEditSpec(
       input.referenceMediaIds
     );
     if (mediaErrors.length > 0) {
-      return { ok: false, errors: mediaErrors };
+      const invalidIndices = new Set<number>();
+      for (const msg of mediaErrors) {
+        const match = /^tracks\[(\d+)\]/.exec(msg);
+        if (match) {
+          invalidIndices.add(Number(match[1]));
+        }
+      }
+      return {
+        ok: false,
+        brief,
+        errors: mediaErrors,
+        filledSpecCandidate: filledRecord,
+        invalidTrackIndices: Array.from(invalidIndices).sort((a, b) => a - b),
+      };
     }
 
     return {
       ok: true,
       spec: normalized.spec,
       brief,
-      warnings: normalized.warnings,
+      warnings: [...filled.warnings, ...normalized.warnings],
       errors: [],
     };
   };
@@ -563,21 +608,48 @@ export async function generateEditSpec(
     };
   }
 
-  // Call 2: single repair attempt
+  // Call 2: compact repair attempt sending only invalid tracks (when available) + exact errors
   onStatus?.('Repairing the spec');
   calls += 1;
 
+  const allowedMediaIds = input.mediaItems
+    .map((item, idx) => resolveMediaId(item, idx))
+    .filter((id) => !(input.referenceMediaIds ?? []).includes(id));
+
+  let invalidSliceText = firstRes.text;
+  if (
+    firstEval.filledSpecCandidate &&
+    Array.isArray(firstEval.filledSpecCandidate.tracks)
+  ) {
+    const rawTracks = firstEval.filledSpecCandidate.tracks;
+    const indices =
+      firstEval.invalidTrackIndices && firstEval.invalidTrackIndices.length > 0
+        ? firstEval.invalidTrackIndices
+        : rawTracks.map((_, idx) => idx);
+    const invalidTracks = indices
+      .filter((idx) => idx >= 0 && idx < rawTracks.length)
+      .map((idx) => ({
+        trackIndex: idx,
+        track: rawTracks[idx],
+      }));
+    invalidSliceText = JSON.stringify({
+      format: firstEval.filledSpecCandidate.format ?? input.format,
+      totalSeconds: firstEval.filledSpecCandidate.totalSeconds ?? input.targetSeconds,
+      invalidTracks,
+    });
+  }
+
   const repairContents: GeminiContent[] = [
-    ...contents,
-    {
-      role: 'model',
-      parts: [{ text: firstRes.text }],
-    },
     {
       role: 'user',
       parts: [
         {
-          text: `Your previous JSON failed validation with these errors:\n${firstEval.errors.join('\n')}\n\nFix ALL errors and return ONLY the corrected EditSpec JSON with "brief". Only use allowed timeline mediaIds from the uploaded media list and stay within each source duration.`,
+          text: [
+            `ALLOWED TIMELINE MEDIA IDS: ${allowedMediaIds.join(', ') || 'none'}`,
+            `INVALID TRACKS SLICE:\n${invalidSliceText}`,
+            `VALIDATION ERRORS:\n${firstEval.errors.join('\n')}`,
+            `Fix ALL listed errors and return ONLY a valid EditSpec JSON object with "brief". Every video track MUST have numeric inPoint and outPoint inside its source clip duration, and totalSeconds <= ${MAX_TIMELINE_SECONDS}.`,
+          ].join('\n\n'),
         },
       ],
     },
@@ -591,7 +663,7 @@ export async function generateEditSpec(
     contents: repairContents,
     responseMimeType: 'application/json',
     responseSchema,
-    temperature: 0.7,
+    temperature: 0.4,
     maxOutputTokens: 3000,
     thinkingConfig,
     onStatus: input.onGeminiStatus,
@@ -599,7 +671,43 @@ export async function generateEditSpec(
   });
   addUsageTokens(tokens, repairRes.usageMetadata);
 
-  const secondEval = evaluateOutput(repairRes.text);
+  let secondEval = evaluateOutput(repairRes.text);
+  if (
+    !secondEval.ok &&
+    firstEval.filledSpecCandidate &&
+    Array.isArray(firstEval.filledSpecCandidate.tracks) &&
+    firstEval.invalidTrackIndices &&
+    firstEval.invalidTrackIndices.length > 0
+  ) {
+    // If Gemini returned only the repaired tracks in repairRes, patch them back into the original candidate.
+    try {
+      const parsedRepair = extractJsonFromText(repairRes.text);
+      if (isRecord(parsedRepair) && Array.isArray(parsedRepair.tracks)) {
+        const repairTracks: unknown[] = parsedRepair.tracks;
+        const mergedTracks = [...firstEval.filledSpecCandidate.tracks];
+        if (repairTracks.length === firstEval.invalidTrackIndices.length) {
+          firstEval.invalidTrackIndices.forEach((origIdx, patchIdx) => {
+            mergedTracks[origIdx] = repairTracks[patchIdx];
+          });
+          const mergedJson = JSON.stringify({
+            ...firstEval.filledSpecCandidate,
+            brief:
+              typeof parsedRepair.brief === 'string'
+                ? parsedRepair.brief
+                : firstEval.brief,
+            tracks: mergedTracks,
+          });
+          const mergedEval = evaluateOutput(mergedJson);
+          if (mergedEval.ok) {
+            secondEval = mergedEval;
+          }
+        }
+      }
+    } catch {
+      // Fall through to secondEval errors
+    }
+  }
+
   if (secondEval.ok && secondEval.spec) {
     return {
       spec: secondEval.spec,

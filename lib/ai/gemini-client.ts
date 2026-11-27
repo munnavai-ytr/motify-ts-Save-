@@ -15,9 +15,9 @@ import { recordUsageLedgerEntry } from '@/lib/usage-ledger';
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 export const DEFAULT_ATTEMPT_TIMEOUT_MS = 120_000;
-export const DEFAULT_TOTAL_BUDGET_MS = 240_000;
-export const DEFAULT_MAX_TRANSIENT_ATTEMPTS = 3;
-const DEFAULT_RETRY_DELAYS_MS = [1500, 4000];
+export const DEFAULT_TOTAL_BUDGET_MS = 150_000;
+export const DEFAULT_MAX_TRANSIENT_ATTEMPTS = 4;
+export const DEFAULT_RETRY_DELAYS_MS = [2000, 5000, 10000];
 const DEFAULT_RETRY_AFTER_CAP_MS = 60_000;
 
 const BLOCKED_FINISH_REASONS = new Set([
@@ -155,6 +155,7 @@ export interface GeminiGenerateParams {
   responseMimeType?: 'application/json' | 'text/plain';
   responseSchema?: Record<string, unknown>;
   maxTransientAttempts?: number;
+  maxConsecutiveFastFailAttempts?: number;
   retryDelaysMs?: number[];
   retryAfterCapMs?: number;
   attemptTimeoutMs?: number;
@@ -242,9 +243,9 @@ function computeRetryDelayMs(
     Math.max(0, failedAttemptIndex - 1),
     Math.max(0, retryDelaysMs.length - 1)
   );
-  const baseMs = retryDelaysMs[idx] ?? 4000;
-  const jitterMs = Math.round(Math.random() * 350);
-  return Math.min(baseMs + jitterMs, capMs);
+  const baseMs = retryDelaysMs[idx] ?? 10_000;
+  const jitterFactor = 0.8 + Math.random() * 0.4;
+  return Math.min(Math.max(0, Math.round(baseMs * jitterFactor)), capMs);
 }
 
 function describeRetryReason(err: GeminiRequestError): string {
@@ -358,7 +359,7 @@ async function executeSingleFetch(params: {
   if (remainingBudgetMs <= 0) {
     throw createTimeoutError(
       'timeout_budget',
-      'Whole-call 240s budget was already exhausted before starting attempt.'
+      'Whole-call 150s budget was already exhausted before starting attempt.'
     );
   }
 
@@ -604,6 +605,12 @@ async function executeSingleFetch(params: {
   }
 }
 
+const FAST_FAIL_CONSECUTIVE_KINDS = new Set<GeminiErrorKind>([
+  'overloaded',
+  'timeout',
+  'model_not_found',
+]);
+
 async function executeWithTransientRetry(params: {
   trimmedKey: string;
   normalizedModel: string;
@@ -615,6 +622,7 @@ async function executeWithTransientRetry(params: {
   responseMimeType?: 'application/json' | 'text/plain';
   responseSchema?: Record<string, unknown>;
   maxTransientAttempts: number;
+  maxConsecutiveFastFailAttempts?: number;
   retryDelaysMs: number[];
   retryAfterCapMs: number;
   scaledAttemptTimeoutMs: number;
@@ -634,6 +642,7 @@ async function executeWithTransientRetry(params: {
 }> {
   const shortModel = formatShortModelName(params.normalizedModel);
   let attempt = 1;
+  let consecutiveFastFailCount = 0;
 
   while (true) {
     if (params.signal?.aborted) {
@@ -643,7 +652,7 @@ async function executeWithTransientRetry(params: {
     if (Date.now() >= params.deadlineMs) {
       throw createTimeoutError(
         'timeout_budget',
-        'Whole-call 240s budget exceeded.'
+        'Whole-call 150s budget exceeded.'
       );
     }
 
@@ -675,12 +684,25 @@ async function executeWithTransientRetry(params: {
         });
       }
 
+      if (FAST_FAIL_CONSECUTIVE_KINDS.has(geminiErr.kind)) {
+        consecutiveFastFailCount += 1;
+      } else {
+        consecutiveFastFailCount = 0;
+      }
+
+      const hitFastFailLimit =
+        typeof params.maxConsecutiveFastFailAttempts === 'number' &&
+        params.maxConsecutiveFastFailAttempts > 0 &&
+        FAST_FAIL_CONSECUTIVE_KINDS.has(geminiErr.kind) &&
+        consecutiveFastFailCount >= params.maxConsecutiveFastFailAttempts;
+
       const effectiveMaxAttempts =
         geminiErr.kind === 'model_not_found'
           ? Math.min(2, params.maxTransientAttempts)
           : params.maxTransientAttempts;
 
       if (
+        !hitFastFailLimit &&
         geminiErr.kind !== 'timeout_budget' &&
         attempt < effectiveMaxAttempts &&
         geminiErr.retryable
@@ -808,6 +830,7 @@ export async function callGeminiGenerateContent(
       responseMimeType: params.responseMimeType,
       responseSchema: params.responseSchema,
       maxTransientAttempts,
+      maxConsecutiveFastFailAttempts: params.maxConsecutiveFastFailAttempts,
       retryDelaysMs,
       retryAfterCapMs,
       scaledAttemptTimeoutMs,
@@ -849,6 +872,7 @@ export async function callGeminiGenerateContent(
         responseMimeType: params.responseMimeType,
         responseSchema: params.responseSchema,
         maxTransientAttempts,
+        maxConsecutiveFastFailAttempts: params.maxConsecutiveFastFailAttempts,
         retryDelaysMs,
         retryAfterCapMs,
         scaledAttemptTimeoutMs,
@@ -888,6 +912,7 @@ export async function callGeminiGenerateContent(
         maxOutputTokens: params.maxOutputTokens,
         thinkingConfig: effectiveThinkingConfig,
         maxTransientAttempts,
+        maxConsecutiveFastFailAttempts: params.maxConsecutiveFastFailAttempts,
         retryDelaysMs,
         retryAfterCapMs,
         scaledAttemptTimeoutMs,

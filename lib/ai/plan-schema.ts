@@ -222,13 +222,26 @@ export function normalizeDirectorPayload(raw: unknown): unknown {
     if (!('plan' in copy) || copy.plan === undefined) {
       copy.plan = null;
     }
-    if (typeof copy.ops === 'string') {
+    const rawOpsSource =
+      typeof copy.opsJson === 'string' && copy.opsJson.trim().length > 0
+        ? copy.opsJson
+        : copy.ops;
+
+    if (typeof rawOpsSource === 'string') {
+      const cleaned = rawOpsSource
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/, '')
+        .trim();
       try {
-        copy.ops = JSON.parse(copy.ops) as unknown;
+        copy.ops = JSON.parse(cleaned) as unknown;
       } catch {
-        // Leave string as-is so Zod reports the parse issue
+        copy.ops = rawOpsSource;
       }
+    } else if (Array.isArray(copy.opsJson)) {
+      copy.ops = copy.opsJson;
     }
+    delete copy.opsJson;
   }
 
   if (isPlainRecord(copy.plan) && isPlainRecord(copy.plan.audio)) {
@@ -376,10 +389,9 @@ export const GEMINI_DIRECTOR_RESPONSE_SCHEMA: Record<string, unknown> = {
       items: { type: 'STRING' },
       nullable: false,
     },
-    ops: {
-      type: 'ARRAY',
+    opsJson: {
+      type: 'STRING',
       nullable: true,
-      items: { type: 'OBJECT' },
     },
     plan: {
       type: 'OBJECT',

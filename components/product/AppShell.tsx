@@ -12,7 +12,12 @@ import { WifiOff } from 'lucide-react';
 import { useOnlineStatus } from '@/hooks/use-online';
 import { useVisualViewportHeight } from '@/hooks/use-visual-viewport';
 import { buildMultimodalTurnParts } from '@/lib/agent/context';
-import { isBengaliText, isBuildIntent } from '@/lib/agent/intent';
+import {
+  buildLocalGreetingReply,
+  isBengaliText,
+  isBuildIntent,
+  isPureGreeting,
+} from '@/lib/agent/intent';
 import {
   runMediaTurn,
   type MediaUsageDelta,
@@ -36,7 +41,10 @@ import {
 } from '@/lib/ai/animator';
 import { runDirectorTurn } from '@/lib/ai/director';
 import { isAbortError } from '@/lib/ai/gemini-client';
-import { GeminiRequestError } from '@/lib/ai/gemini-errors';
+import {
+  GeminiRequestError,
+  type GeminiErrorKind,
+} from '@/lib/ai/gemini-errors';
 import { applyOpsToPlan } from '@/lib/ai/plan-edit';
 import { validatePlanTotalDuration } from '@/lib/ai/plan-schema';
 import { compileComponent, type CompiledComponentType } from '@/lib/compile';
@@ -62,7 +70,7 @@ import {
   updateMessage,
   updateProject,
 } from '@/lib/db';
-import type { GeminiModel } from '@/lib/gemini';
+import { listGeminiModels, type GeminiModel } from '@/lib/gemini';
 import {
   createKitHistory,
   type KitHistoryController,
@@ -76,13 +84,16 @@ import {
   clearStoredProjectFormat,
   getStoredActiveProjectId,
   getStoredApiKey,
+  getStoredAutoBackupModels,
   getStoredAutoBuild,
   getStoredBackupModel,
+  getStoredCachedModels,
   getStoredDefaultFormat,
   getStoredModel,
   getStoredProjectFormat,
   getStoredUseMedia,
   setStoredActiveProjectId,
+  setStoredCachedModels,
   setStoredProjectFormat,
 } from '@/lib/storage';
 import type {
@@ -123,7 +134,7 @@ import {
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { Button } from '@/components/ui/Button';
 import { ToastProvider, useToast } from '@/components/ui/Toast';
-import { ChatPanel } from './ChatPanel';
+import { ChatPanel, type PausedBusyRetryState } from './ChatPanel';
 import { Onboarding } from './Onboarding';
 import { ProjectsDrawer } from './ProjectsDrawer';
 import {
@@ -144,6 +155,31 @@ const EMPTY_SESSION_USAGE: SessionUsage = {
   outputTokens: 0,
   thoughtTokens: 0,
 };
+
+const AUTO_RESUME_DELAYS_MS = [30_000, 60_000, 90_000] as const;
+
+function isBusyPauseErrorKind(kind: GeminiErrorKind | undefined): boolean {
+  return (
+    kind === 'overloaded' ||
+    kind === 'timeout' ||
+    kind === 'timeout_budget' ||
+    kind === 'quota_minute'
+  );
+}
+
+interface PendingBusyRetryTask {
+  mode: 'director' | 'media';
+  project: Project;
+  conversationMessages: ChatMessage[];
+  userPrompt: string;
+  mediaRecords: MediaRecord[];
+  userMessageId: string;
+  route?: RouteTurnResult;
+  existingIntroMsg?: AssistantTextMessage | null;
+  nextAutoAttempt: number;
+  retryAt: number;
+  isBengali: boolean;
+}
 
 function compileVideosFromMessages(
   msgs: ChatMessage[]
@@ -233,6 +269,9 @@ function WorkspaceShell() {
   const [useMedia, setUseMedia] = useState<boolean>(() =>
     typeof window !== 'undefined' ? getStoredUseMedia() : true
   );
+  const [autoBackupModels, setAutoBackupModels] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? getStoredAutoBackupModels() : true
+  );
   const [defaultFormat, setDefaultFormat] = useState<FormatPreference>(() =>
     typeof window !== 'undefined' ? getStoredDefaultFormat() : 'auto'
   );
@@ -240,7 +279,12 @@ function WorkspaceShell() {
     useState<FormatPreference | null>(null);
   const [activeProjectFormatPref, setActiveProjectFormatPref] =
     useState<FormatPreference | null>(null);
-  const [models, setModels] = useState<GeminiModel[]>([]);
+  const [models, setModels] = useState<GeminiModel[]>(() =>
+    typeof window !== 'undefined' ? getStoredCachedModels() : []
+  );
+  const [pausedBusyRetry, setPausedBusyRetry] =
+    useState<PausedBusyRetryState | null>(null);
+  const [busyRetryTicket, setBusyRetryTicket] = useState(0);
 
   const [projects, setProjects] = useState<Project[]>([]);
   const [messageCountByProjectId, setMessageCountByProjectId] = useState<
@@ -285,6 +329,8 @@ function WorkspaceShell() {
   const queuedDraftsRef = useRef<QueuedMessageDraft[]>([]);
   const handledRuntimeErrorsRef = useRef<Set<string>>(new Set());
   const kitHistoryRef = useRef<Map<string, KitHistoryController>>(new Map());
+  const pendingBusyRetryRef = useRef<PendingBusyRetryTask | null>(null);
+  const triggerBusyRetryNowRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     activeProjectIdRef.current = activeProjectId;
@@ -298,6 +344,7 @@ function WorkspaceShell() {
     return () => {
       abortControllerRef.current?.abort();
       videoAbortControllerRef.current?.abort();
+      pendingBusyRetryRef.current = null;
     };
   }, []);
 
@@ -307,7 +354,123 @@ function WorkspaceShell() {
     ? backupModel || getStoredBackupModel()
     : '';
 
+  useEffect(() => {
+    if (!hydrated || !effectiveApiKey) return;
+    let cancelled = false;
+    const cached = getStoredCachedModels();
+    if (cached.length > 0) {
+      queueMicrotask(() => {
+        if (!cancelled) {
+          setModels((prev) => (prev.length > 0 ? prev : cached));
+        }
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const controller = new AbortController();
+    void listGeminiModels(effectiveApiKey, { signal: controller.signal })
+      .then((res) => {
+        if (cancelled || controller.signal.aborted) return;
+        const capable = res.models.filter((m) =>
+          m.supportedGenerationMethods.includes('generateContent')
+        );
+        if (capable.length > 0) {
+          setStoredCachedModels(capable);
+          setModels(capable);
+        }
+      })
+      .catch(() => {
+        // Silent background warmup; settings refresh reports interactive errors
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [effectiveApiKey, hydrated]);
+
+  const clearBusyRetryState = useCallback(() => {
+    pendingBusyRetryRef.current = null;
+    setPausedBusyRetry(null);
+  }, []);
+
+  const scheduleBusyRetry = useCallback(
+    (task: Omit<PendingBusyRetryTask, 'retryAt'>) => {
+      const delayMs =
+        AUTO_RESUME_DELAYS_MS[
+          Math.min(
+            AUTO_RESUME_DELAYS_MS.length - 1,
+            Math.max(0, task.nextAutoAttempt - 1)
+          )
+        ];
+      const retryAt = Date.now() + delayMs;
+      pendingBusyRetryRef.current = {
+        ...task,
+        retryAt,
+      };
+      setPausedBusyRetry({
+        attemptNumber: task.nextAutoAttempt,
+        maxAttempts: AUTO_RESUME_DELAYS_MS.length,
+        secondsRemaining: Math.ceil(delayMs / 1000),
+        isBengali: task.isBengali,
+      });
+      setBusyRetryTicket((n) => n + 1);
+    },
+    []
+  );
+
+  const handleRetryBusyNow = useCallback(() => {
+    triggerBusyRetryNowRef.current?.();
+  }, []);
+
+  const handleCancelBusyRetry = useCallback(() => {
+    clearBusyRetryState();
+    setQueuedDrafts((prev) =>
+      prev.map((d) =>
+        d.status === 'queued' ? { ...d, status: 'paused_failed' } : d
+      )
+    );
+  }, [clearBusyRetryState]);
+
+  useEffect(() => {
+    if (busyRetryTicket === 0 || !pendingBusyRetryRef.current) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      const task = pendingBusyRetryRef.current;
+      if (!task) {
+        window.clearInterval(intervalId);
+        setPausedBusyRetry(null);
+        return;
+      }
+      const remainingMs = task.retryAt - Date.now();
+      if (remainingMs <= 0) {
+        window.clearInterval(intervalId);
+        triggerBusyRetryNowRef.current?.();
+        return;
+      }
+      const nextSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
+      setPausedBusyRetry((prev) => {
+        if (!prev || prev.secondsRemaining === nextSeconds) {
+          return prev;
+        }
+        return {
+          ...prev,
+          secondsRemaining: nextSeconds,
+        };
+      });
+    }, 500);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [busyRetryTicket]);
+
   const abortInFlight = useCallback(() => {
+    clearBusyRetryState();
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -337,7 +500,7 @@ function WorkspaceShell() {
     setBuildingVideoMessageId(null);
     setActiveVideoStatusDetail(null);
     setActiveVideoWaitStartedAt(null);
-  }, []);
+  }, [clearBusyRetryState]);
 
   const refreshProjectsList = useCallback(async () => {
     const rows = await listProjectsWithMessageCounts();
@@ -627,7 +790,8 @@ function WorkspaceShell() {
       conversationMessages: ChatMessage[],
       userPrompt: string,
       mediaRecords: MediaRecord[],
-      userMessageId: string
+      userMessageId: string,
+      options?: { autoBusyAttempt?: number }
     ) => Promise<void>) | null
   >(null);
 
@@ -638,9 +802,46 @@ function WorkspaceShell() {
       userPrompt: string,
       newMediaRecords: MediaRecord[],
       userMessageId: string,
-      route: RouteTurnResult
+      route: RouteTurnResult,
+      options?: {
+        autoBusyAttempt?: number;
+        existingIntroMsg?: AssistantTextMessage | null;
+      }
     ) => Promise<void>) | null
   >(null);
+
+  useEffect(() => {
+    triggerBusyRetryNowRef.current = () => {
+      const task = pendingBusyRetryRef.current;
+      if (!task) return;
+      clearBusyRetryState();
+      if (task.mode === 'media' && task.route && executeMediaTurnRef.current) {
+        void executeMediaTurnRef.current(
+          task.project,
+          task.conversationMessages,
+          task.userPrompt,
+          task.mediaRecords,
+          task.userMessageId,
+          task.route,
+          {
+            autoBusyAttempt: task.nextAutoAttempt,
+            existingIntroMsg: task.existingIntroMsg ?? null,
+          }
+        );
+        return;
+      }
+      if (executeDirectorTurnRef.current) {
+        void executeDirectorTurnRef.current(
+          task.project,
+          task.conversationMessages,
+          task.userPrompt,
+          task.mediaRecords,
+          task.userMessageId,
+          { autoBusyAttempt: task.nextAutoAttempt }
+        );
+      }
+    };
+  }, [clearBusyRetryState]);
 
   const startVideoBuildRef = useRef<
     ((
@@ -734,6 +935,20 @@ function WorkspaceShell() {
       setMessages(updatedHistory);
 
       await refreshProjectsList();
+
+      if (fullMediaRecords.length === 0 && isPureGreeting(content)) {
+        const greetingReply = await addMessage({
+          projectId: targetProject.id,
+          type: 'assistant_text',
+          content: buildLocalGreetingReply(content),
+          createdAt: Math.max(Date.now(), userMsg.createdAt + 1),
+        });
+        if (activeProjectIdRef.current === targetProject.id) {
+          setMessages([...updatedHistory, greetingReply]);
+        }
+        await refreshProjectsList();
+        return true;
+      }
 
       const latestActivePlanMsg =
         [...existingMessages]
@@ -860,7 +1075,8 @@ function WorkspaceShell() {
       conversationMessages: ChatMessage[],
       userPrompt: string,
       mediaRecords: MediaRecord[] = [],
-      userMessageId: string = createDbId()
+      userMessageId: string = createDbId(),
+      options?: { autoBusyAttempt?: number }
     ) => {
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -909,6 +1125,7 @@ function WorkspaceShell() {
           ) ?? null;
 
       let turnSucceeded = false;
+      let pausedForBusy = false;
 
       try {
         updateLiveRun((r) => withStepStatus(r, 'understand', 'done'));
@@ -1357,50 +1574,68 @@ function WorkspaceShell() {
           }
           turnSucceeded = true;
         } else {
-          const failedRun = withRunFinalState(
-            withStepStatus(currentRun, 'check', 'failed'),
-            {
-              status: 'failed',
-              error: {
-                summary: result.summary,
-                userAction: result.userAction,
-                errorKind: result.errorKind,
-                details: result.details,
-                retryable: result.retryable,
-                retryPrompt: userPrompt,
-                retryAttachments: mediaRecords.map((m) => ({
-                  mediaId: m.id,
-                  kind: m.kind,
-                  name: m.name,
-                  mime: m.mime,
-                  size: m.size,
-                  width: m.width,
-                  height: m.height,
-                  duration: m.duration,
-                })),
-              },
-            }
-          );
-          await persistRun(failedRun);
-          setRunsById((prev) => ({ ...prev, [failedRun.id]: failedRun }));
+          const currentAutoAttempt = options?.autoBusyAttempt ?? 0;
+          if (
+            isBusyPauseErrorKind(result.errorKind) &&
+            currentAutoAttempt < AUTO_RESUME_DELAYS_MS.length
+          ) {
+            pausedForBusy = true;
+            scheduleBusyRetry({
+              mode: 'director',
+              project: targetProject,
+              conversationMessages,
+              userPrompt,
+              mediaRecords,
+              userMessageId,
+              nextAutoAttempt: currentAutoAttempt + 1,
+              isBengali: isBengaliText(userPrompt),
+            });
+          } else {
+            const failedRun = withRunFinalState(
+              withStepStatus(currentRun, 'check', 'failed'),
+              {
+                status: 'failed',
+                error: {
+                  summary: result.summary,
+                  userAction: result.userAction,
+                  errorKind: result.errorKind,
+                  details: result.details,
+                  retryable: result.retryable,
+                  retryPrompt: userPrompt,
+                  retryAttachments: mediaRecords.map((m) => ({
+                    mediaId: m.id,
+                    kind: m.kind,
+                    name: m.name,
+                    mime: m.mime,
+                    size: m.size,
+                    width: m.width,
+                    height: m.height,
+                    duration: m.duration,
+                  })),
+                },
+              }
+            );
+            await persistRun(failedRun);
+            setRunsById((prev) => ({ ...prev, [failedRun.id]: failedRun }));
 
-          const errorMsg = await addMessage({
-            projectId: targetProject.id,
-            type: 'error',
-            runId: failedRun.id,
-            summary: result.summary,
-            userAction: result.userAction,
-            errorKind: result.errorKind,
-            needsBackupModel:
-              result.errorKind === 'model_not_found' && !effectiveBackupModel,
-            details: result.details,
-            retryable: result.retryable,
-            retryPrompt: userPrompt,
-            retryAttachments: failedRun.error?.retryAttachments,
-            debugInfo: result.debugInfo,
-          });
-          if (activeProjectIdRef.current === targetProject.id) {
-            setMessages((prev) => [...prev, errorMsg]);
+            const errorMsg = await addMessage({
+              projectId: targetProject.id,
+              type: 'error',
+              runId: failedRun.id,
+              summary: result.summary,
+              userAction: result.userAction,
+              errorKind: result.errorKind,
+              needsBackupModel:
+                result.errorKind === 'model_not_found' && !effectiveBackupModel,
+              details: result.details,
+              retryable: result.retryable,
+              retryPrompt: userPrompt,
+              retryAttachments: failedRun.error?.retryAttachments,
+              debugInfo: result.debugInfo,
+            });
+            if (activeProjectIdRef.current === targetProject.id) {
+              setMessages((prev) => [...prev, errorMsg]);
+            }
           }
         }
 
@@ -1469,7 +1704,7 @@ function WorkspaceShell() {
                 );
               }, 0);
             }
-          } else {
+          } else if (!pausedForBusy) {
             setQueuedDrafts((prev) =>
               prev.map((d) =>
                 d.status === 'queued' ? { ...d, status: 'paused_failed' } : d
@@ -1487,6 +1722,7 @@ function WorkspaceShell() {
       effectiveBackupModel,
       effectiveModel,
       refreshProjectsList,
+      scheduleBusyRetry,
     ]
   );
 
@@ -1501,7 +1737,11 @@ function WorkspaceShell() {
       userPrompt: string,
       newMediaRecords: MediaRecord[],
       userMessageId: string,
-      route: RouteTurnResult
+      route: RouteTurnResult,
+      options?: {
+        autoBusyAttempt?: number;
+        existingIntroMsg?: AssistantTextMessage | null;
+      }
     ) => {
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -1588,19 +1828,22 @@ function WorkspaceShell() {
               ? 'Using your clips & audio. Editing now…'
               : 'Using your uploaded media. Editing now…';
 
-      let introMsg: AssistantTextMessage | null = null;
+      let introMsg: AssistantTextMessage | null = options?.existingIntroMsg ?? null;
       let turnSucceeded = false;
+      let pausedForBusy = false;
 
       try {
-        introMsg = (await addMessage({
-          projectId: targetProject.id,
-          type: 'assistant_text',
-          content: introContent,
-          createdAt: Date.now(),
-        })) as AssistantTextMessage;
+        if (!introMsg) {
+          introMsg = (await addMessage({
+            projectId: targetProject.id,
+            type: 'assistant_text',
+            content: introContent,
+            createdAt: Date.now(),
+          })) as AssistantTextMessage;
 
-        if (activeProjectIdRef.current === targetProject.id) {
-          setMessages((prev) => [...prev, introMsg!]);
+          if (activeProjectIdRef.current === targetProject.id) {
+            setMessages((prev) => [...prev, introMsg!]);
+          }
         }
 
         // Gather user media records (filter out prior rendered MP4 outputs/thumbnails)
@@ -1829,24 +2072,60 @@ function WorkspaceShell() {
         terminateFFmpeg();
 
         const isGeminiErr = err instanceof GeminiRequestError;
+        const currentAutoAttempt = options?.autoBusyAttempt ?? 0;
+        if (
+          isGeminiErr &&
+          isBusyPauseErrorKind(err.kind) &&
+          currentAutoAttempt < AUTO_RESUME_DELAYS_MS.length
+        ) {
+          pausedForBusy = true;
+          scheduleBusyRetry({
+            mode: 'media',
+            project: targetProject,
+            conversationMessages,
+            userPrompt,
+            mediaRecords: newMediaRecords,
+            userMessageId,
+            route,
+            existingIntroMsg: introMsg,
+            nextAutoAttempt: currentAutoAttempt + 1,
+            isBengali: useBengali,
+          });
+          return;
+        }
+
         const oom = isOutOfMemoryError(err);
+        const rawErrMsg = err instanceof Error ? err.message : String(err);
+        const isValidationErr =
+          !isGeminiErr &&
+          !oom &&
+          /validation|editspec|edit spec|timeline|tracks?\.\d|inpoint|outpoint|invalid/i.test(
+            rawErrMsg
+          );
+
         const summary = isGeminiErr
           ? err.message
           : oom
             ? 'The browser ran out of memory while editing. Try fewer or shorter clips.'
-            : err instanceof Error
-              ? err.message
-              : String(err);
+            : isValidationErr
+              ? useBengali
+                ? 'এই ক্লিপগুলো কীভাবে এডিট করতে হবে তা স্পষ্ট নয়। কোন স্টাইল, ক্রম বা দৈর্ঘ্য চান তা বলুন।'
+                : 'I could not understand how to edit those clips together. Tell me the style, order, or length you want.'
+              : rawErrMsg;
         const userAction = isGeminiErr
           ? err.userAction
           : oom
             ? 'Try trimming clips shorter or attaching fewer clips, then retry.'
-            : 'Review your clips or edit instructions and retry.';
+            : isValidationErr
+              ? useBengali
+                ? 'আপনার পছন্দের স্টাইল, ক্লিপের ক্রম বা কত সেকেন্ডের ভিডিও চান লিখে আবার চেষ্টা করুন।'
+                : 'Tell me the style, clip order, or target length you want and try again.'
+              : 'Review your clips or edit instructions and retry.';
         const details = isGeminiErr
           ? err.rawDetails || err.explanation
           : err instanceof Error
             ? err.stack || err.message
-            : String(err);
+            : rawErrMsg;
 
         const retryAttachments = newMediaRecords.map((m) => ({
           mediaId: m.id,
@@ -1933,7 +2212,7 @@ function WorkspaceShell() {
                 );
               }, 0);
             }
-          } else {
+          } else if (!pausedForBusy) {
             setQueuedDrafts((prev) =>
               prev.map((d) =>
                 d.status === 'queued' ? { ...d, status: 'paused_failed' } : d
@@ -1950,6 +2229,7 @@ function WorkspaceShell() {
       effectiveBackupModel,
       effectiveModel,
       refreshProjectsList,
+      scheduleBusyRetry,
     ]
   );
 
@@ -1983,6 +2263,7 @@ function WorkspaceShell() {
       return true;
     }
 
+    clearBusyRetryState();
     return dispatchUserTurnImmediate(content, attachments);
   };
 
@@ -3295,6 +3576,9 @@ function WorkspaceShell() {
               buildingVideoMessageId={buildingVideoMessageId}
               queuedDrafts={queuedDrafts}
               cachedMediaById={cachedMediaById}
+              pausedBusyRetry={pausedBusyRetry}
+              onRetryBusyNow={handleRetryBusyNow}
+              onCancelBusyRetry={handleCancelBusyRetry}
               onSendMessage={handleSendMessage}
               onStopThinking={abortInFlight}
               onCancelQueued={handleCancelQueued}
@@ -3353,6 +3637,8 @@ function WorkspaceShell() {
         onAutoBuildChange={setAutoBuild}
         useMedia={useMedia}
         onUseMediaChange={setUseMedia}
+        autoBackupModels={autoBackupModels}
+        onAutoBackupModelsChange={setAutoBackupModels}
         defaultFormat={defaultFormat}
         onDefaultFormatChange={setDefaultFormat}
         sessionUsage={sessionUsage}

@@ -1,16 +1,19 @@
 import {
   ACTIVE_PROJECT_STORAGE,
+  AUTO_BACKUP_MODELS_STORAGE,
   AUTO_BUILD_STORAGE,
   DAILY_REQUEST_LIMITS_STORAGE,
   DEFAULT_FORMAT_STORAGE,
   EXPORT_MODE_STORAGE,
   GEMINI_API_KEY_STORAGE,
   GEMINI_BACKUP_MODEL_STORAGE,
+  GEMINI_MODELS_CACHE_STORAGE,
   GEMINI_MODEL_STORAGE,
   PROJECT_FORMAT_STORAGE_PREFIX,
   THEME_STORAGE,
   USE_MEDIA_STORAGE,
 } from './constants';
+import type { GeminiModel } from './gemini';
 import type { ExportMode, FormatPreference, ThemePreference } from './types';
 
 function readStorage(key: string): string | null {
@@ -202,6 +205,81 @@ export function getStoredUseMedia(): boolean {
 
 export function setStoredUseMedia(enabled: boolean): void {
   writeStorage(USE_MEDIA_STORAGE, enabled ? 'true' : 'false');
+}
+
+export function getStoredAutoBackupModels(): boolean {
+  const raw = readStorage(AUTO_BACKUP_MODELS_STORAGE);
+  if (raw === 'false') {
+    return false;
+  }
+  return true;
+}
+
+export function setStoredAutoBackupModels(enabled: boolean): void {
+  writeStorage(AUTO_BACKUP_MODELS_STORAGE, enabled ? 'true' : 'false');
+}
+
+export function getStoredCachedModels(): GeminiModel[] {
+  const raw = readStorage(GEMINI_MODELS_CACHE_STORAGE);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const models: GeminiModel[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== 'string' || !rec.name.trim()) continue;
+      const methods = Array.isArray(rec.supportedGenerationMethods)
+        ? rec.supportedGenerationMethods.filter(
+            (m): m is string => typeof m === 'string'
+          )
+        : [];
+      models.push({
+        name: rec.name.trim(),
+        displayName:
+          typeof rec.displayName === 'string' && rec.displayName.trim()
+            ? rec.displayName.trim()
+            : rec.name.trim(),
+        ...(typeof rec.description === 'string'
+          ? { description: rec.description }
+          : {}),
+        supportedGenerationMethods: methods,
+        ...(typeof rec.inputTokenLimit === 'number'
+          ? { inputTokenLimit: rec.inputTokenLimit }
+          : {}),
+        ...(typeof rec.outputTokenLimit === 'number'
+          ? { outputTokenLimit: rec.outputTokenLimit }
+          : {}),
+      });
+    }
+    return models;
+  } catch {
+    return [];
+  }
+}
+
+export function setStoredCachedModels(models: readonly GeminiModel[]): void {
+  if (!models || models.length === 0) {
+    removeStorage(GEMINI_MODELS_CACHE_STORAGE);
+    return;
+  }
+  const compact = models.map((m) => ({
+    name: m.name,
+    displayName: m.displayName,
+    supportedGenerationMethods: m.supportedGenerationMethods,
+    ...(typeof m.inputTokenLimit === 'number'
+      ? { inputTokenLimit: m.inputTokenLimit }
+      : {}),
+    ...(typeof m.outputTokenLimit === 'number'
+      ? { outputTokenLimit: m.outputTokenLimit }
+      : {}),
+  }));
+  writeStorage(GEMINI_MODELS_CACHE_STORAGE, JSON.stringify(compact));
+}
+
+export function clearStoredCachedModels(): void {
+  removeStorage(GEMINI_MODELS_CACHE_STORAGE);
 }
 
 function isFormatPreference(value: string | null): value is FormatPreference {

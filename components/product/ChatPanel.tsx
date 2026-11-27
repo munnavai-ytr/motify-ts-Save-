@@ -50,6 +50,13 @@ import { MediaVideoCard } from './MediaVideoCard';
 import { MessageAttachments } from './MessageAttachments';
 import { ThinkingBlock } from './ThinkingBlock';
 
+export interface PausedBusyRetryState {
+  attemptNumber: number;
+  maxAttempts: number;
+  secondsRemaining: number;
+  isBengali: boolean;
+}
+
 interface ChatPanelProps {
   project: Project | null;
   messages: ChatMessage[];
@@ -60,6 +67,9 @@ interface ChatPanelProps {
   buildingVideoMessageId: string | null;
   queuedDrafts: QueuedMessageDraft[];
   cachedMediaById: Record<string, MediaRecord>;
+  pausedBusyRetry?: PausedBusyRetryState | null;
+  onRetryBusyNow?: () => void;
+  onCancelBusyRetry?: () => void;
   onSendMessage: (
     content: string,
     attachments: Array<Omit<MediaRecord, 'projectId'>>
@@ -219,6 +229,9 @@ export function ChatPanel({
   buildingVideoMessageId,
   queuedDrafts,
   cachedMediaById,
+  pausedBusyRetry = null,
+  onRetryBusyNow,
+  onCancelBusyRetry,
   onSendMessage,
   onStopThinking,
   onCancelQueued,
@@ -794,7 +807,7 @@ export function ChatPanel({
             <div className="ml-auto h-11 w-3/5 animate-pulse rounded-[16px] bg-surface-2" />
             <div className="mx-auto h-10 w-4/5 animate-pulse rounded-[12px] bg-surface-2" />
           </div>
-        ) : messages.length === 0 && !isThinking && queuedDrafts.length === 0 ? (
+        ) : messages.length === 0 && !isThinking && queuedDrafts.length === 0 && !pausedBusyRetry ? (
           <div className="flex h-full flex-col items-center justify-center py-8 text-center">
             <h1 className="text-xl font-semibold tracking-tight text-text text-balance">
               What are we making?
@@ -810,6 +823,49 @@ export function ChatPanel({
             {activeRun && (
               <div className="flex flex-col items-start">
                 <ThinkingBlock run={activeRun} isActive={true} />
+              </div>
+            )}
+
+            {pausedBusyRetry && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="rounded-[14px] border border-warning/30 bg-surface-1 px-4 py-3 text-sm text-text"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-0.5 min-w-0">
+                    <p className="font-medium text-text">
+                      {pausedBusyRetry.isBengali
+                        ? `গুগলের সার্ভার এখন ব্যস্ত। ${pausedBusyRetry.secondsRemaining} সেকেন্ড পর আবার চেষ্টা করা হবে`
+                        : `Google is busy. Retrying automatically in ${pausedBusyRetry.secondsRemaining} s`}
+                    </p>
+                    <p className="text-xs text-text-muted">
+                      {pausedBusyRetry.isBengali
+                        ? `স্বয়ংক্রিয় চেষ্টা ${pausedBusyRetry.attemptNumber}/${pausedBusyRetry.maxAttempts}`
+                        : `Attempt ${pausedBusyRetry.attemptNumber} of ${pausedBusyRetry.maxAttempts}`}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {onRetryBusyNow && (
+                      <button
+                        type="button"
+                        onClick={onRetryBusyNow}
+                        className="inline-flex min-h-[32px] items-center rounded-[10px] bg-accent px-3 py-1 text-xs font-medium text-accent-fg hover:brightness-110 transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      >
+                        {pausedBusyRetry.isBengali ? 'এখনই চেষ্টা করুন' : 'Retry now'}
+                      </button>
+                    )}
+                    {onCancelBusyRetry && (
+                      <button
+                        type="button"
+                        onClick={onCancelBusyRetry}
+                        className="inline-flex min-h-[32px] items-center rounded-[10px] border border-border bg-surface-2 px-3 py-1 text-xs font-medium text-text-secondary hover:bg-surface-1 hover:text-text transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      >
+                        {pausedBusyRetry.isBengali ? 'বাতিল' : 'Cancel'}
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
 

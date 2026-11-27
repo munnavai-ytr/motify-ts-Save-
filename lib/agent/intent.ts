@@ -150,3 +150,25 @@ export function isBuildIntent(
 export function isBengaliText(text: string): boolean {
   return /[\u0980-\u09FF]/.test(text);
 }
+
+const PURE_GREETING_RE =
+  /^(?:hi|hello|hey|yo|sup|hii+|helo+|good morning|good afternoon|good evening|salam|assalamu\s*alaikum|nomoshkar|হাই|হ্যালো|হ্যালোও*|নমস্কার|সালাম|আসসালামু\s*আলাইকুম|সুপ্রভাত)$/iu;
+
+export function isPureGreeting(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.includes('?') || trimmed.includes('？')) {
+    return false;
+  }
+  const normalized = trimmed.replace(/[!.,।\s]+$/g, '').trim();
+  if (!normalized) {
+    return false;
+  }
+  return PURE_GREETING_RE.test(normalized);
+}
+
+export function buildLocalGreetingReply(text: string): string {
+  if (isBengaliText(text)) {
+    return 'হাই! কী ধরনের ভিডিও বানাতে চান বলুন, অথবা ক্লিপ ও ছবি অ্যাটাচ করুন—আমি এডিট করে দেব।';
+  }
+  return 'Hi! Tell me what video to make, or attach clips and photos and I will edit them.';
+}

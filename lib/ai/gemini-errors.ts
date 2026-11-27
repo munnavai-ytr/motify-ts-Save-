@@ -257,7 +257,7 @@ export function createTimeoutError(
       userAction:
         'Try again, simplify your prompt, or switch to a faster model in Settings.',
       explanation:
-        'The whole-call 240-second budget across attempts and retry waits was exceeded.',
+        'The whole-call 150-second budget across attempts and retry waits was exceeded.',
       rawDetails,
     });
   }

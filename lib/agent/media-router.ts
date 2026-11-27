@@ -52,29 +52,40 @@ export interface RouteTurnResult {
   };
 }
 
+function unicodeWordBoundaryRegex(pattern: string): RegExp {
+  return new RegExp(
+    `(?<![\\p{L}\\p{M}\\p{N}_])(?:${pattern})(?![\\p{L}\\p{M}\\p{N}_])`,
+    'iu'
+  );
+}
+
 const GREETING_OR_QUESTION_RE =
-  /^(hi|hello|hey|yo|sup|good morning|good evening|thanks|thank you|ok thanks|নমস্কার|হ্যালো|হাই|সালাম|আসসালামু আলাইকুম|কেমন আছ|ধন্যবাদ)[!.\s।]*$/i;
+  /^(?:hi|hello|hey|yo|sup|hii+|helo+|good morning|good afternoon|good evening|thanks|thank you|ok thanks|salam|assalamu\s*alaikum|nomoshkar|নমস্কার|হ্যালো|হ্যালোও*|হাই|সালাম|আসসালামু\s*আলাইকুম|কেমন আছ|ধন্যবাদ|সুপ্রভাত)[!.,।\s]*$/iu;
 
-const REFERENCE_INTENT_RE =
-  /\b(same style|like this|in this style|copy this style|reference|as a reference|inspired by|mimic this|match this style|style reference)\b/i;
+const REFERENCE_INTENT_RE = unicodeWordBoundaryRegex(
+  'same style|like this|in this style|copy this style|reference|as a reference|inspired by|mimic this|match this style|style reference'
+);
 const REFERENCE_INTENT_BN_RE =
-  /(এই স্টাইলে|এই ভিডিওর মতো|সেম স্টাইল|রেফারেন্স|এর মতো)/;
+  /(?<![\p{L}\p{M}\p{N}_])(?:এই স্টাইলে|এই ভিডিওর মতো|সেম স্টাইল|রেফারেন্স|এর মতো)/u;
 
-const FOOTAGE_USE_RE =
-  /\b(use my|use these|use this|with my|from my|my clips?|my videos?|my photos?|my pictures?|my images?|my footage|assemble|edit|cut|trim|highlight|reel|combine|merge|compile|montage|slideshow|color grade|grade|captions?|subtitles?|slow motion|speed up|blur|crop|fit|make a video with|put together)\b/i;
+const FOOTAGE_USE_RE = unicodeWordBoundaryRegex(
+  'use my|use these|use this|with my|from my|my clips?|my videos?|my photos?|my pictures?|my images?|my footage|assemble|edit|cut|trim|highlight|reel|combine|merge|compile|montage|slideshow|color grade|grade|captions?|subtitles?|slow motion|speed up|blur|crop|fit|make a video with|put together'
+);
 const FOOTAGE_USE_BN_RE =
-  /(আমার ভিডিও|আমার ছবি|এই ভিডিও|এগুলো দিয়ে|এগুলা দিয়ে|ব্যবহার করে|এডিট|কাট|ট্রিম|রিল|জোড়া|কম্বাইন|বানিয়ে দাও|বানাও|তৈরি করো)/;
+  /(?<![\p{L}\p{M}\p{N}_])(?:আমার ভিডিও|আমার ছবি|এই ভিডিও|এগুলো দিয়ে|এগুলা দিয়ে|ব্যবহার করে|এডিট|কাট|ট্রিম|রিল|জোড়া|কম্বাইন|বানিয়ে দাও|বানাও|তৈরি করো)/u;
 
-const HYBRID_INTENT_RE =
-  /\b(intro|outro|title card|title screen|titles?|branding|motion graphics?|cta|call to action|lower[- ]?third|subscribe|animated text|opener|end screen)\b/i;
+const HYBRID_INTENT_RE = unicodeWordBoundaryRegex(
+  'intro|outro|title card|title screen|titles?|branding|motion graphics?|cta|call to action|lower[- ]?third|subscribe|animated text|opener|end screen'
+);
 const HYBRID_INTENT_BN_RE =
-  /(ইন্ট্রো|আউট্রো|টাইটেল|মোশন গ্রাফিক্স|ব্র্যান্ডিং)/;
+  /(?<![\p{L}\p{M}\p{N}_])(?:ইন্ট্রো|আউট্রো|টাইটেল|মোশন গ্রাফিক্স|ব্র্যান্ডিং)/u;
 
-const PURE_MOTION_SWITCH_RE =
-  /\b(2d motion graphics|animated typography|no footage|without my video|without footage|pure motion|motion graphic explainer)\b/i;
+const PURE_MOTION_SWITCH_RE = unicodeWordBoundaryRegex(
+  '2d motion graphics|animated typography|no footage|without my video|without footage|pure motion|motion graphic explainer'
+);
 
 const EDIT_ACTION_VERB_RE =
-  /\b(make|change|trim|cut|short|shorten|long|lengthen|add|remove|delete|replace|update|fix|warm|cool|vintage|noir|vibrant|bright|dark|fast|faster|slow|slower|louder|quieter|mute|volume|music|audio|caption|subtitle|blur|cover|contain|intro|outro|title|cta|grade|color|format|vertical|landscape|square|9:16|16:9|1:1|এডিট|কাট|ছোট|বড়|রঙ|মিউজিক|স্লো|ফাস্ট|টাইটেল|ইন্ট্রো|আউট্রো)\b/i;
+  /(?<![\p{L}\p{M}\p{N}_])(?:(?:make|change|trim|cut|short|shorten|long|lengthen|add|remove|delete|replace|update|fix|warm|cool|vintage|noir|vibrant|bright|dark|fast|faster|slow|slower|louder|quieter|mute|volume|music|audio|caption|subtitle|blur|cover|contain|intro|outro|title|cta|grade|color|format|vertical|landscape|square|9:16|16:9|1:1)|(?:এডিট|কাট|ছোট|বড়|রঙ|মিউজিক|স্লো|ফাস্ট|টাইটেল|ইন্ট্রো|আউট্রো)(?:টা|টি|গুলো|গুলা|ের|ে)?)(?![\p{L}\p{M}\p{N}_])/iu;
 
 function hasReferenceIntent(text: string): boolean {
   return REFERENCE_INTENT_RE.test(text) || REFERENCE_INTENT_BN_RE.test(text);

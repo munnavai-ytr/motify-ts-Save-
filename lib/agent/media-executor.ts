@@ -1,6 +1,12 @@
 import { isAbortError, type GeminiStatusEvent } from '@/lib/ai/gemini-client';
 import { extractJsonFromText } from '@/lib/ai/plan-schema';
 import type { RouteTurnResult } from '@/lib/agent/media-router';
+import {
+  getEditSpecCache,
+  getMediaAnalysisCache,
+  putEditSpecCache,
+  putMediaAnalysisCache,
+} from '@/lib/db';
 import { exportCompositionToMp4 } from '@/lib/export';
 import {
   containsBengali,
@@ -126,6 +132,19 @@ function throwIfAborted(signal?: AbortSignal): void {
   }
 }
 
+function hashCacheString(input: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i);
+    h1 ^= code;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 ^= code + ((i & 0xff) << 8);
+    h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+
 function resolveEditFormat(
   preference: FormatPreference,
   mediaRecords: ReadonlyArray<MediaRecord>,
@@ -162,7 +181,9 @@ function resolveEditFormat(
 
 function parseTargetSecondsFromPrompt(prompt: string): number | null {
   const match =
-    /(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds|সেকেন্ড)\b/i.exec(prompt);
+    /(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds|সেকেন্ড)(?![\p{L}\p{M}\p{N}_])/iu.exec(
+      prompt
+    );
   if (!match) return null;
   const val = Number(match[1]);
   if (!Number.isFinite(val) || val <= 0) return null;
@@ -533,7 +554,16 @@ export async function runMediaTurn(
     params.onSubNote?.(null, memWarn);
   }
 
-  // (a) Vision Analysis (reusing existing analysis on text-only follow-up edits)
+  const analysisSignature = `${uniqueRecords
+    .map(
+      (r) =>
+        `${r.id}:${r.kind}:${r.size}:${r.duration ?? 0}:${r.width ?? 0}x${r.height ?? 0}`
+    )
+    .sort()
+    .join('|')}|budget:${JSON.stringify(CHAT_ANALYSIS_BUDGET)}`;
+  const analysisCacheKey = `analysis_${hashCacheString(analysisSignature)}`;
+
+  // (a) Vision Analysis (reusing existing message analysis or IndexedDB 24h cache)
   let analysis: MediaAnalysis | null = null;
   const canReuseExistingAnalysis =
     params.route.editExisting &&
@@ -545,57 +575,69 @@ export async function runMediaTurn(
   } else {
     params.onStep?.('analyze', 'running');
     try {
-      const analyzerItems = toAnalyzerInputItems(uniqueRecords);
-      analysis = await analyzeMedia(
-        analyzerItems,
-        params.apiKey,
-        params.modelName,
-        params.signal,
-        {
-          backupModelName: params.backupModelName,
-          maxFramesPerVideo: CHAT_ANALYSIS_BUDGET.maxFramesPerVideo,
-          frameWidth: CHAT_ANALYSIS_BUDGET.frameWidth,
-          imageMaxSide: CHAT_ANALYSIS_BUDGET.imageMaxSide,
-          jpegQuality: CHAT_ANALYSIS_BUDGET.jpegQuality,
-          maxTotalMediaParts: CHAT_ANALYSIS_BUDGET.maxTotalMediaParts,
-          maxAudioSeconds: CHAT_ANALYSIS_BUDGET.maxAudioSeconds,
-          maxAudioBytes: CHAT_ANALYSIS_BUDGET.maxAudioBytes,
-          onStatus: (ev) => {
-            if (ev.type === 'attempt') {
-              lastAnsweringModel = ev.model;
-              if (ev.isBackup) usedBackupModel = true;
-            } else if (ev.type === 'fallback') {
-              lastAnsweringModel = ev.toModel;
-              usedBackupModel = true;
-            }
-            params.onStatus?.(ev);
-          },
-        }
+      const cachedAnalysis = await getMediaAnalysisCache(analysisCacheKey).catch(
+        () => null
       );
-      totalCalls += 1;
-      lastAnsweringModel = analysis.modelName || lastAnsweringModel;
-      const pTok = analysis.usageMetadata?.promptTokenCount ?? 0;
-      const oTok = analysis.usageMetadata?.candidatesTokenCount ?? 0;
-      const tTok = analysis.usageMetadata?.thoughtsTokenCount ?? 0;
-      totalTokens.prompt += pTok;
-      totalTokens.output += oTok;
-      totalTokens.thinking += tTok;
+      if (cachedAnalysis) {
+        analysis = cachedAnalysis;
+        params.onSubNote?.('analyze', 'Reused cached media analysis');
+        params.onStep?.('analyze', 'done');
+      } else {
+        const analyzerItems = toAnalyzerInputItems(uniqueRecords);
+        analysis = await analyzeMedia(
+          analyzerItems,
+          params.apiKey,
+          params.modelName,
+          params.signal,
+          {
+            backupModelName: params.backupModelName,
+            maxFramesPerVideo: CHAT_ANALYSIS_BUDGET.maxFramesPerVideo,
+            frameWidth: CHAT_ANALYSIS_BUDGET.frameWidth,
+            imageMaxSide: CHAT_ANALYSIS_BUDGET.imageMaxSide,
+            jpegQuality: CHAT_ANALYSIS_BUDGET.jpegQuality,
+            maxTotalMediaParts: CHAT_ANALYSIS_BUDGET.maxTotalMediaParts,
+            maxAudioSeconds: CHAT_ANALYSIS_BUDGET.maxAudioSeconds,
+            maxAudioBytes: CHAT_ANALYSIS_BUDGET.maxAudioBytes,
+            onStatus: (ev) => {
+              if (ev.type === 'attempt') {
+                lastAnsweringModel = ev.model;
+                if (ev.isBackup) usedBackupModel = true;
+              } else if (ev.type === 'fallback') {
+                lastAnsweringModel = ev.toModel;
+                usedBackupModel = true;
+              }
+              params.onStatus?.(ev);
+            },
+          }
+        );
+        totalCalls += 1;
+        lastAnsweringModel = analysis.modelName || lastAnsweringModel;
+        const pTok = analysis.usageMetadata?.promptTokenCount ?? 0;
+        const oTok = analysis.usageMetadata?.candidatesTokenCount ?? 0;
+        const tTok = analysis.usageMetadata?.thoughtsTokenCount ?? 0;
+        totalTokens.prompt += pTok;
+        totalTokens.output += oTok;
+        totalTokens.thinking += tTok;
 
-      params.onUsage?.({
-        requestsMade: 1,
-        promptTokens: pTok,
-        outputTokens: oTok,
-        thoughtTokens: tTok,
-        modelName: lastAnsweringModel,
-        usedBackup: usedBackupModel,
-      });
+        params.onUsage?.({
+          requestsMade: 1,
+          promptTokens: pTok,
+          outputTokens: oTok,
+          thoughtTokens: tTok,
+          modelName: lastAnsweringModel,
+          usedBackup: usedBackupModel,
+        });
 
-      for (const w of analysis.warnings) {
-        warnings.push(w);
-        params.onSubNote?.('analyze', w);
+        for (const w of analysis.warnings) {
+          warnings.push(w);
+          params.onSubNote?.('analyze', w);
+        }
+
+        await putMediaAnalysisCache(analysisCacheKey, analysis).catch(
+          () => undefined
+        );
+        params.onStep?.('analyze', 'done');
       }
-
-      params.onStep?.('analyze', 'done');
     } catch (err: unknown) {
       if (isAbortError(err) || params.signal?.aborted) {
         throw err;
@@ -607,7 +649,7 @@ export async function runMediaTurn(
 
   throwIfAborted(params.signal);
 
-  // (b) Plan the EditSpec via AI Edit Director
+  // (b) Plan the EditSpec via AI Edit Director (reusing 24h IndexedDB cache on retry)
   params.onStep?.('plan_edit', 'running');
   const resolvedFormat = resolveEditFormat(
     params.format,
@@ -623,69 +665,117 @@ export async function runMediaTurn(
     params.route.editExisting ? params.existingMediaVideo?.editSpec : undefined
   );
 
+  const editSpecSignature = [
+    analysisCacheKey,
+    params.userPrompt.trim().toLowerCase(),
+    resolvedFormat,
+    String(targetSeconds),
+    params.route.route,
+    String(params.route.referenceOnly),
+    params.route.referenceMediaIds.slice().sort().join(','),
+    params.existingMediaVideo?.id ?? '',
+  ].join('||');
+  const editSpecCacheKey = `editspec_${hashCacheString(editSpecSignature)}`;
+
   let directorResult: Awaited<ReturnType<typeof generateEditSpec>>;
   try {
-    directorResult = await generateEditSpec(
-      {
-        userRequest: params.userPrompt,
-        mediaItems: toDirectorMediaItems(uniqueRecords),
-        analysis,
-        format: resolvedFormat,
-        targetSeconds,
-        language: params.language,
-        referenceOnly: params.route.referenceOnly,
-        referenceMediaIds: params.route.referenceMediaIds,
-        existingEditSpec: params.route.editExisting
-          ? params.existingMediaVideo?.editSpec
-          : undefined,
-        allowHybridMG: params.route.route === 'hybrid',
-        backupModelName: params.backupModelName,
-        onGeminiStatus: (ev) => {
-          if (ev.type === 'attempt') {
-            lastAnsweringModel = ev.model;
-            if (ev.isBackup) usedBackupModel = true;
-          } else if (ev.type === 'fallback') {
-            lastAnsweringModel = ev.toModel;
-            usedBackupModel = true;
-          }
-          params.onStatus?.(ev);
-        },
-      },
-      params.apiKey,
-      params.modelName,
-      params.signal,
-      (status) => {
-        if (status === 'Repairing the spec') {
-          params.onSubNote?.('plan_edit', 'Repairing edit timeline spec...');
-        }
-      }
+    const cachedSpec = await getEditSpecCache(editSpecCacheKey).catch(
+      () => null
     );
+    if (cachedSpec) {
+      directorResult = {
+        spec: cachedSpec.spec,
+        brief: cachedSpec.brief,
+        warnings: cachedSpec.warnings,
+        calls: 0,
+        tokens: { prompt: 0, output: 0, thinking: 0 },
+        ms: 0,
+        modelName: cachedSpec.modelName,
+        usedBackupModel: cachedSpec.usedBackupModel,
+      };
+      if (cachedSpec.modelName) {
+        lastAnsweringModel = cachedSpec.modelName;
+      }
+      if (cachedSpec.usedBackupModel) {
+        usedBackupModel = true;
+      }
+      for (const w of cachedSpec.warnings) {
+        warnings.push(w);
+      }
+      params.onSubNote?.('plan_edit', 'Reused saved timeline spec');
+      params.onStep?.('plan_edit', 'done');
+    } else {
+      directorResult = await generateEditSpec(
+        {
+          userRequest: params.userPrompt,
+          mediaItems: toDirectorMediaItems(uniqueRecords),
+          analysis,
+          format: resolvedFormat,
+          targetSeconds,
+          language: params.language,
+          referenceOnly: params.route.referenceOnly,
+          referenceMediaIds: params.route.referenceMediaIds,
+          existingEditSpec: params.route.editExisting
+            ? params.existingMediaVideo?.editSpec
+            : undefined,
+          allowHybridMG: params.route.route === 'hybrid',
+          backupModelName: params.backupModelName,
+          onGeminiStatus: (ev) => {
+            if (ev.type === 'attempt') {
+              lastAnsweringModel = ev.model;
+              if (ev.isBackup) usedBackupModel = true;
+            } else if (ev.type === 'fallback') {
+              lastAnsweringModel = ev.toModel;
+              usedBackupModel = true;
+            }
+            params.onStatus?.(ev);
+          },
+        },
+        params.apiKey,
+        params.modelName,
+        params.signal,
+        (status) => {
+          if (status === 'Repairing the spec') {
+            params.onSubNote?.('plan_edit', 'Repairing edit timeline spec...');
+          }
+        }
+      );
 
-    totalCalls += directorResult.calls;
-    totalTokens.prompt += directorResult.tokens.prompt;
-    totalTokens.output += directorResult.tokens.output;
-    totalTokens.thinking += directorResult.tokens.thinking;
-    if (directorResult.modelName) {
-      lastAnsweringModel = directorResult.modelName;
+      totalCalls += directorResult.calls;
+      totalTokens.prompt += directorResult.tokens.prompt;
+      totalTokens.output += directorResult.tokens.output;
+      totalTokens.thinking += directorResult.tokens.thinking;
+      if (directorResult.modelName) {
+        lastAnsweringModel = directorResult.modelName;
+      }
+      if (directorResult.usedBackupModel) {
+        usedBackupModel = true;
+      }
+
+      params.onUsage?.({
+        requestsMade: directorResult.calls,
+        promptTokens: directorResult.tokens.prompt,
+        outputTokens: directorResult.tokens.output,
+        thoughtTokens: directorResult.tokens.thinking,
+        modelName: lastAnsweringModel,
+        usedBackup: usedBackupModel,
+      });
+
+      for (const w of directorResult.warnings) {
+        warnings.push(w);
+      }
+
+      // Save validated EditSpec BEFORE starting FFmpeg render so render retries skip AI calls
+      await putEditSpecCache(editSpecCacheKey, {
+        spec: directorResult.spec,
+        brief: directorResult.brief,
+        warnings: directorResult.warnings,
+        modelName: directorResult.modelName,
+        usedBackupModel: directorResult.usedBackupModel,
+      }).catch(() => undefined);
+
+      params.onStep?.('plan_edit', 'done');
     }
-    if (directorResult.usedBackupModel) {
-      usedBackupModel = true;
-    }
-
-    params.onUsage?.({
-      requestsMade: directorResult.calls,
-      promptTokens: directorResult.tokens.prompt,
-      outputTokens: directorResult.tokens.output,
-      thoughtTokens: directorResult.tokens.thinking,
-      modelName: lastAnsweringModel,
-      usedBackup: usedBackupModel,
-    });
-
-    for (const w of directorResult.warnings) {
-      warnings.push(w);
-    }
-
-    params.onStep?.('plan_edit', 'done');
   } catch (err: unknown) {
     if (isAbortError(err) || params.signal?.aborted) {
       throw err;

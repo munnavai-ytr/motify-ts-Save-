@@ -19,7 +19,11 @@ import {
   type GeminiModel,
 } from '@/lib/gemini';
 import { APP_NAME, GOOGLE_AI_STUDIO_KEY_URL } from '@/lib/constants';
-import { setStoredApiKey, setStoredModel } from '@/lib/storage';
+import {
+  setStoredApiKey,
+  setStoredCachedModels,
+  setStoredModel,
+} from '@/lib/storage';
 import { Button } from '@/components/ui/Button';
 import { IconButton } from '@/components/ui/IconButton';
 
@@ -106,6 +110,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       }
 
       setModels(capable);
+      setStoredCachedModels(capable);
       setSelectedModel(pickDefaultModel(capable));
       setStep(2);
     } catch (err: unknown) {
@@ -144,6 +149,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
 
     setStoredApiKey(trimmedKey);
     setStoredModel(selectedModel);
+    setStoredCachedModels(models);
     onComplete({
       apiKey: trimmedKey,
       selectedModel,

@@ -1266,18 +1266,104 @@ export function getOpsJsonSchema(): Record<string, unknown> {
   };
 }
 
+const CANONICAL_OP_EXAMPLES = [
+  'EXAMPLES:',
+  '- "Make it blue" -> [{"type":"setPalette","palette":"ocean"}]',
+  '- "Make scene 2 shorter" -> [{"type":"setDuration","scene":1,"dur":2.5}]',
+  '- "Change CTA text" -> [{"type":"setSlot","scene":0,"slot":"cta","value":"Start free today"}]',
+  '- "Add upbeat music" -> [{"type":"setMusic","source":"synth","style":"upbeat-pop"}]',
+].join('\n');
+
+interface ZodInspectableField {
+  value?: unknown;
+  options?: readonly unknown[];
+  isOptional?: () => boolean;
+  unwrap?: () => unknown;
+}
+
+function describeFieldSpec(name: string, rawField: unknown): string {
+  let optional = false;
+  let current: unknown = rawField;
+  for (let depth = 0; depth < 4 && current && typeof current === 'object'; depth++) {
+    const f = current as ZodInspectableField;
+    if (typeof f.isOptional === 'function' && f.isOptional()) {
+      optional = true;
+    }
+    if (Array.isArray(f.options)) {
+      const vals = f.options.map((v) => JSON.stringify(v)).join('|');
+      return `${name}${optional ? '?' : ''}: ${vals}`;
+    }
+    if (typeof f.unwrap === 'function') {
+      current = f.unwrap();
+      continue;
+    }
+    break;
+  }
+  return `${name}${optional ? '?' : ''}`;
+}
+
 export function describeOpsForAI(): string {
-  return [
-    'MOTION KIT REVISION OPS:',
-    '- setSlot { scene, slot, value }: edit text or icon slot on a scene.',
-    '- setItems { scene, slot, items }: replace list/steps/leftItems/rightItems/highlights/words/data.',
-    '- setLayout { scene, layout }, setVariant { scene, variant }, setDuration { scene, dur }.',
-    '- addScene { afterScene?, scene }, removeScene { scene }, moveScene { from, to }, duplicateScene { scene }.',
-    '- setStyle { style, resetSceneOverrides? }, setPalette { palette }, setCustomColors { colors }, setMood { mood }, setIntensity { intensity }.',
-    '- setTransition { scope: "global"|"scene", scene?, transition }, setCamera { scene, camera }, setSeed { seed }, setFormat { format }, setTitle { title }.',
-    '- setMusic { source?: "synth"|"upload"|"off", style?: lofi|corporate|upbeat-pop|cinematic|playful|tech-pulse|ambient, bpm?, seed?, volume? (0..1), mediaId?, startAt?, loop? }.',
-    '- setMusicVolume { volume (0..1) }, setSfx { sfx: "auto"|"minimal"|"off" }, setSfxVolume { volume (0..1) }, muteAudio { mute: boolean }.',
-  ].join('\n');
+  const lines: string[] = ['MOTION KIT REVISION OPS (derived from schema):'];
+  for (const option of OpSchema.options) {
+    const shape = option.shape as Record<string, unknown>;
+    const typeField = shape.type as ZodInspectableField | undefined;
+    const opName = typeof typeField?.value === 'string' ? typeField.value : 'unknown';
+    const argSpecs = Object.entries(shape)
+      .filter(([key]) => key !== 'type')
+      .map(([key, field]) => describeFieldSpec(key, field));
+    lines.push(`- ${opName} { ${argSpecs.join(', ')} }`);
+  }
+  lines.push(CANONICAL_OP_EXAMPLES);
+  return lines.join('\n');
+}
+
+export interface ValidateAndFilterOpsResult {
+  validOps: Op[];
+  warnings: string[];
+  errors: string[];
+}
+
+export function validateAndFilterOps(
+  rawOps: readonly unknown[],
+  spec?: VideoSpec | null
+): ValidateAndFilterOpsResult {
+  const validOps: Op[] = [];
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  let runningSpec = spec ?? null;
+
+  rawOps.forEach((rawOp, idx) => {
+    const rawType =
+      rawOp && typeof rawOp === 'object' && !Array.isArray(rawOp) && 'type' in rawOp
+        ? String((rawOp as { type?: unknown }).type ?? 'unknown')
+        : 'invalid';
+
+    const parsed = OpSchema.safeParse(rawOp);
+    if (!parsed.success) {
+      const msg = parsed.error.issues
+        .map((issue) => `${issue.path.join('.') || 'op'}: ${issue.message}`)
+        .join('; ');
+      const line = `Op #${idx + 1} (${rawType}) skipped: ${msg}`;
+      errors.push(line);
+      warnings.push(line);
+      return;
+    }
+
+    if (runningSpec) {
+      const check = applyOps(runningSpec, [parsed.data]);
+      if (check.errors.length > 0) {
+        const line = `Op #${idx + 1} (${parsed.data.type}) skipped: ${check.errors.join('; ')}`;
+        errors.push(line);
+        warnings.push(line);
+        return;
+      }
+      runningSpec = check.spec;
+    }
+
+    validOps.push(parsed.data);
+  });
+
+  return { validOps, warnings, errors };
 }
 
 export function findSceneByRef(

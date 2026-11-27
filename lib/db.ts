@@ -36,6 +36,22 @@ export interface UsageLedgerRecord {
   ok: boolean;
 }
 
+export interface CachedEditSpecPayload {
+  spec: EditSpec;
+  brief: string;
+  warnings: string[];
+  modelName?: string;
+  usedBackupModel?: boolean;
+}
+
+export interface MediaCacheRecord {
+  key: string;
+  kind: 'analysis' | 'edit_spec';
+  createdAt: number;
+  expiresAt: number;
+  payload: unknown;
+}
+
 interface MotionAIDB extends DBSchema {
   projects: {
     key: string;
@@ -62,10 +78,16 @@ interface MotionAIDB extends DBSchema {
     value: MediaRecord;
     indexes: { 'by-projectId': string };
   };
+  media_cache: {
+    key: string;
+    value: MediaCacheRecord;
+    indexes: { 'by-expiresAt': number };
+  };
 }
 
 const DB_NAME = 'motionai_db';
-const DB_VERSION = 7;
+const DB_VERSION = 8;
+const MEDIA_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 let dbPromise: Promise<IDBPDatabase<MotionAIDB>> | null = null;
 
@@ -156,6 +178,14 @@ export function getDb(): Promise<IDBPDatabase<MotionAIDB>> {
               keyPath: 'id',
             });
             mediaStore.createIndex('by-projectId', 'projectId');
+          }
+        }
+        if (oldVersion < 8) {
+          if (!db.objectStoreNames.contains('media_cache')) {
+            const cacheStore = db.createObjectStore('media_cache', {
+              keyPath: 'key',
+            });
+            cacheStore.createIndex('by-expiresAt', 'expiresAt');
           }
         }
       },
@@ -829,13 +859,93 @@ export async function getDataCounts(): Promise<{
   };
 }
 
+export async function getMediaAnalysisCache(
+  key: string
+): Promise<MediaAnalysis | null> {
+  if (!key) return null;
+  const db = await getDb();
+  const row = await db.get('media_cache', key);
+  if (!row || row.kind !== 'analysis') return null;
+  if (row.expiresAt <= Date.now()) {
+    await db.delete('media_cache', key).catch(() => undefined);
+    return null;
+  }
+  const payload = row.payload as Partial<MediaAnalysis> | undefined;
+  if (!payload || !Array.isArray(payload.items)) {
+    return null;
+  }
+  return payload as MediaAnalysis;
+}
+
+export async function putMediaAnalysisCache(
+  key: string,
+  analysis: MediaAnalysis
+): Promise<void> {
+  if (!key) return;
+  const db = await getDb();
+  const now = Date.now();
+  await db.put('media_cache', {
+    key,
+    kind: 'analysis',
+    createdAt: now,
+    expiresAt: now + MEDIA_CACHE_TTL_MS,
+    payload: analysis,
+  });
+}
+
+export async function getEditSpecCache(
+  key: string
+): Promise<CachedEditSpecPayload | null> {
+  if (!key) return null;
+  const db = await getDb();
+  const row = await db.get('media_cache', key);
+  if (!row || row.kind !== 'edit_spec') return null;
+  if (row.expiresAt <= Date.now()) {
+    await db.delete('media_cache', key).catch(() => undefined);
+    return null;
+  }
+  const payload = row.payload as Partial<CachedEditSpecPayload> | undefined;
+  if (!payload || !payload.spec || !Array.isArray(payload.spec.tracks)) {
+    return null;
+  }
+  return {
+    spec: payload.spec,
+    brief: typeof payload.brief === 'string' ? payload.brief : 'Assembled video edit.',
+    warnings: Array.isArray(payload.warnings) ? payload.warnings : [],
+    ...(typeof payload.modelName === 'string' ? { modelName: payload.modelName } : {}),
+    ...(typeof payload.usedBackupModel === 'boolean'
+      ? { usedBackupModel: payload.usedBackupModel }
+      : {}),
+  };
+}
+
+export async function putEditSpecCache(
+  key: string,
+  value: CachedEditSpecPayload
+): Promise<void> {
+  if (!key) return;
+  const db = await getDb();
+  const now = Date.now();
+  await db.put('media_cache', {
+    key,
+    kind: 'edit_spec',
+    createdAt: now,
+    expiresAt: now + MEDIA_CACHE_TTL_MS,
+    payload: value,
+  });
+}
+
 export async function deleteAllLocalData(): Promise<void> {
   const db = await getDb();
-  const tx = db.transaction(['projects', 'messages', 'runs', 'media'], 'readwrite');
+  const tx = db.transaction(
+    ['projects', 'messages', 'runs', 'media', 'media_cache'],
+    'readwrite'
+  );
   await tx.objectStore('messages').clear();
   await tx.objectStore('projects').clear();
   await tx.objectStore('runs').clear();
   await tx.objectStore('media').clear();
+  await tx.objectStore('media_cache').clear();
   await tx.done;
 }
 

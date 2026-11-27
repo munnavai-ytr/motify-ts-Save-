@@ -29,16 +29,20 @@ import {
   maskApiKey,
   type GeminiModel,
 } from '@/lib/gemini';
+import { clearAllModelCooldowns } from '@/lib/ai/gemini-policy';
 import {
   clearStoredApiKey,
+  getStoredAutoBackupModels,
   getStoredAutoBuild,
   getStoredDailyRequestLimits,
   getStoredDefaultFormat,
   getStoredUseMedia,
   normalizeModelStorageKey,
   setStoredApiKey,
+  setStoredAutoBackupModels,
   setStoredAutoBuild,
   setStoredBackupModel,
+  setStoredCachedModels,
   setStoredDailyRequestLimit,
   setStoredDefaultFormat,
   setStoredModel,
@@ -69,6 +73,8 @@ interface SettingsSheetProps {
   onAutoBuildChange?: (enabled: boolean) => void;
   useMedia?: boolean;
   onUseMediaChange?: (enabled: boolean) => void;
+  autoBackupModels?: boolean;
+  onAutoBackupModelsChange?: (enabled: boolean) => void;
   defaultFormat?: FormatPreference;
   onDefaultFormatChange?: (format: FormatPreference) => void;
   sessionUsage: SessionUsage;
@@ -152,6 +158,8 @@ export function SettingsSheet({
   onAutoBuildChange,
   useMedia,
   onUseMediaChange,
+  autoBackupModels,
+  onAutoBackupModelsChange,
   defaultFormat,
   onDefaultFormatChange,
   sessionUsage,
@@ -202,6 +210,12 @@ export function SettingsSheet({
     typeof window !== 'undefined' ? getStoredUseMedia() : true
   );
   const effectiveUseMedia = useMedia ?? fallbackUseMedia;
+  const [fallbackAutoBackupModels, setFallbackAutoBackupModels] =
+    useState<boolean>(() =>
+      typeof window !== 'undefined' ? getStoredAutoBackupModels() : true
+    );
+  const effectiveAutoBackupModels =
+    autoBackupModels ?? fallbackAutoBackupModels;
   const [fallbackDefaultFormat, setFallbackDefaultFormat] =
     useState<FormatPreference>(() =>
       typeof window !== 'undefined' ? getStoredDefaultFormat() : 'auto'
@@ -319,6 +333,8 @@ export function SettingsSheet({
         : capable.find((m) => m.name.toLowerCase().includes('flash'))?.name ??
           capable[0].name;
 
+      clearAllModelCooldowns();
+      setStoredCachedModels(capable);
       setStoredModel(nextModel);
       onModelsUpdated(capable, nextModel);
 
@@ -377,7 +393,9 @@ export function SettingsSheet({
         capable.find((m) => m.name.toLowerCase().includes('flash'))?.name ??
         capable[0].name;
 
+      clearAllModelCooldowns();
       setStoredApiKey(trimmed);
+      setStoredCachedModels(capable);
       setStoredModel(nextModel);
       onApiKeyUpdated(trimmed);
       onModelsUpdated(capable, nextModel);
@@ -721,6 +739,42 @@ export function SettingsSheet({
                 <p className="text-[11px] leading-relaxed text-text-muted">
                   Used automatically if the primary model is overloaded, times out, or hits quota. Not every listed model is available on the free tier, so test it.
                 </p>
+              </div>
+
+              <div className="flex items-start justify-between gap-3 border-t border-border/70 pt-3">
+                <div className="space-y-1">
+                  <p className="text-xs font-medium text-text">
+                    Auto-pick extra backup models when busy
+                  </p>
+                  <p className="text-[11px] leading-relaxed text-text-muted">
+                    When on, if your primary and backup models are busy or rate limited, up to 2 other fast models from your fetched list are tried automatically.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={effectiveAutoBackupModels}
+                  aria-label="Auto-pick extra backup models when busy"
+                  onClick={() => {
+                    const next = !effectiveAutoBackupModels;
+                    setStoredAutoBackupModels(next);
+                    setFallbackAutoBackupModels(next);
+                    onAutoBackupModelsChange?.(next);
+                  }}
+                  className={cn(
+                    'relative mt-0.5 inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                    effectiveAutoBackupModels
+                      ? 'border-accent bg-accent'
+                      : 'border-border bg-surface-1'
+                  )}
+                >
+                  <span
+                    className={cn(
+                      'inline-block h-4 w-4 rounded-full bg-white shadow transition-transform',
+                      effectiveAutoBackupModels ? 'translate-x-6' : 'translate-x-1'
+                    )}
+                  />
+                </button>
               </div>
 
               {modelsError && (

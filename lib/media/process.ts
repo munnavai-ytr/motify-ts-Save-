@@ -277,6 +277,25 @@ async function seekVideoToTime(
   });
 }
 
+function measureVideoFrameLuminance(
+  video: HTMLVideoElement,
+  probeCanvas: HTMLCanvasElement
+): number {
+  const ctx = probeCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return 1;
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, probeCanvas.width, probeCanvas.height);
+  ctx.drawImage(video, 0, 0, probeCanvas.width, probeCanvas.height);
+  const data = ctx.getImageData(0, 0, probeCanvas.width, probeCanvas.height).data;
+  const pixelCount = probeCanvas.width * probeCanvas.height;
+  if (pixelCount <= 0) return 1;
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    sum += (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 255;
+  }
+  return sum / pixelCount;
+}
+
 async function processVideoFile(
   file: File,
   onProgress: (p: number) => void
@@ -317,10 +336,31 @@ async function processVideoFile(
       Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
     onProgress(0.35);
 
-    const thumbTime = duration > 0 ? Math.min(duration * 0.1, 2) : 0;
-    await seekVideoToTime(video, thumbTime);
+    const MIN_THUMB_LUMINANCE = 0.06;
+    const probeCanvas = document.createElement('canvas');
+    probeCanvas.width = 32;
+    probeCanvas.height = 32;
+    const candidateTimes =
+      duration > 0
+        ? [duration * 0.1, duration * 0.3, duration * 0.5]
+        : [0];
+    let bestThumbCanvas: HTMLCanvasElement | null = null;
+    let bestLuminance = -1;
+
+    for (const candidateTime of candidateTimes) {
+      await seekVideoToTime(video, candidateTime);
+      const luminance = measureVideoFrameLuminance(video, probeCanvas);
+      if (!bestThumbCanvas || luminance > bestLuminance) {
+        bestLuminance = luminance;
+        bestThumbCanvas = drawBitmapScaled(video, width, height, 320);
+      }
+      if (luminance >= MIN_THUMB_LUMINANCE) {
+        break;
+      }
+    }
+
     const thumbBlob = await canvasToJpegBlob(
-      drawBitmapScaled(video, width, height, 320),
+      bestThumbCanvas ?? drawBitmapScaled(video, width, height, 320),
       0.8
     );
     onProgress(0.5);

@@ -13,6 +13,7 @@ TIMELINE RULES:
 - For explainers: title, steps, recap.
 - For music videos: sync cuts to estimated beat (120 BPM / 0.5s or 1.0s beats if no audio track).
 - Keep VideoTrack clips chronological via startAt (sum of preceding VideoTrack / MGTrack durations).
+- Every video track MUST have numeric inPoint and outPoint (seconds, inside the clip duration).
 
 MEDIA USE RULES:
 - Use every uploaded timeline video and image unless the user says otherwise.
@@ -50,6 +51,9 @@ REVISIONS:
 
 HONESTY:
 - If a requested effect is impossible in FFmpeg compositing (e.g., removing a person from footage, adding AI-generated faces, 3D effects), explain briefly in the "brief" field and deliver the closest achievable edit.
+
+EXAMPLE (2 video tracks):
+{"brief":"Tight two-clip cut with warm grade.","v":2,"format":"9:16","fps":30,"totalSeconds":8,"colorGrade":"warm","tracks":[{"kind":"video","mediaId":"m1","startAt":0,"inPoint":0.3,"outPoint":4.3,"fit":"cover","speed":1},{"kind":"video","mediaId":"m2","startAt":4,"inPoint":0,"outPoint":4,"fit":"cover","speed":1}]}
 
 OUTPUT:
 - Return JSON only, matching the EditSpec schema plus a top-level "brief" string (max 30 words describing what you built and why). No markdown.`;

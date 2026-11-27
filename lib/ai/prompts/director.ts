@@ -1,6 +1,7 @@
 import { ROUTER_RULES } from '@/lib/agent/router-prompt';
 import { formatAttachmentSummaryForHistory } from '@/lib/agent/context';
 import { DURATION_LIMITS, formatSeconds } from '@/lib/ai/plan-schema';
+import { describeOpsForAI } from '@/lib/kit/ops';
 import type { VideoSpec } from '@/lib/kit/spec';
 import type {
   ChatMessage,
@@ -62,44 +63,30 @@ REVISING AN EXISTING PLAN
 - For any newly added scene, set its "id" to "new".
 
 TARGETED EDITS TO AN EXISTING VIDEO (NO REBUILD)
-- When the user asks to change the EXISTING video (colors, text, style, speed, layout of one scene, music, format, audio), use kind "edit" and populate "ops" with the minimal set of ops from the following list: setSlot, setItems, setStyle, setPalette, setCustomColors, setMood, setIntensity, setTransition, setCamera, setMusic, setMusicVolume, setSfx, setSfxVolume, muteAudio, setFormat, setDuration, setTitle. Keep "plan" null for edits. Use "plan" only when the user wants a structurally NEW video or adds/removes whole scenes. When in doubt about whether it is an edit or a new video, prefer edit if a video already exists.
-- Op shapes (use exact scene id from EXISTING VIDEO / CURRENT PLAN or 0-based scene index):
-  - { "type": "setSlot", "scene": string | number, "slot": string, "value": string }
-  - { "type": "setItems", "scene": string | number, "slot": string, "items": unknown[] }
-  - { "type": "setStyle", "style": "clean" | "editorial" | "bold-poster" | "neon-tech" | "playful-pop" | "luxe" | "organic-soft" }
-  - { "type": "setPalette", "palette": "ember" | "ocean" | "forest" | "noir" | "neon" | "sunrise" | "lavender" | "mono" }
-  - { "type": "setCustomColors", "colors": { "bg"?: "#RRGGBB", "surface"?: "#RRGGBB", "text"?: "#RRGGBB", "muted"?: "#RRGGBB", "accent"?: "#RRGGBB", "accent2"?: "#RRGGBB" } }
-  - { "type": "setMood", "mood": "bold" | "soft" | "tech" | "elegant" | "playful" }
-  - { "type": "setIntensity", "intensity": "calm" | "balanced" | "energetic" }
-  - { "type": "setTransition", "scope": "global" | "scene", "scene"?: string | number, "transition": "fade" | "push-left" | "push-right" | "push-up" | "wipe-left" | "wipe-up" | "circle-reveal" | "zoom-through" | "color-block" | "cut" }
-  - { "type": "setCamera", "scene": string | number, "camera": "push-in" | "pull-out" | "pan-left" | "pan-right" | "none" }
-  - { "type": "setMusic", "source"?: "synth" | "off", "style"?: "lofi" | "corporate" | "upbeat-pop" | "cinematic" | "playful" | "tech-pulse" | "ambient", "volume"?: number }
-  - { "type": "setMusicVolume", "volume": number }
-  - { "type": "setSfx", "sfx": "auto" | "minimal" | "off" }
-  - { "type": "setSfxVolume", "volume": number }
-  - { "type": "muteAudio", "mute": boolean }
-  - { "type": "setFormat", "format": "9:16" | "16:9" | "1:1" }
-  - { "type": "setDuration", "scene": string | number, "dur": number }
-  - { "type": "setTitle", "title": string }
+- When the user asks to change the EXISTING video (colors, text, style, speed, layout of one scene, music, format, audio), use kind "edit", set "plan" to null, and put a JSON-stringified array of op objects into "opsJson". Keep "plan" null for edits and set "opsJson" to null when kind is "plan" or "reply".
+- Use "plan" only when NO video exists yet or the user wants a structurally NEW video. When in doubt and a video already exists, prefer "edit".
+- Reference existing scenes by exact scene "id" or 0-based index (0 = first scene, 1 = second scene).
+- Every object in the "opsJson" array MUST have a valid "type" from this catalog:
+${describeOpsForAI()}
 
 SOUND: Always include an "audio" field in the plan JSON. Choose musicStyle to match the visual mood (luxe->cinematic, playful-pop->playful, neon-tech->tech-pulse, editorial->lofi, bold-poster->upbeat-pop, organic-soft->ambient, default->corporate). Set sfx to "auto" unless the user asks for silence. Set mute to true only for lower-third overlays. If the user asks for no sound, set mute to true. If the user names a copyrighted song or artist, refuse briefly and use the closest generated style instead.
 
 OUTPUT FORMAT (STRICT UNIFIED JSON CONTRACT)
 Return ONLY one valid JSON object with NO markdown code fences and NO text outside the JSON object.
-All top-level keys ("kind", "message", "assumptions", "plan", "ops") MUST follow this contract:
+Top-level keys ("kind", "message", "assumptions", "plan", "opsJson") MUST follow this contract:
 - "kind": "reply" | "plan" | "edit"
 - "message": non-empty string (your reply text when kind is "reply", a short intro when kind is "plan", or a concise summary of what you changed when kind is "edit")
 - "assumptions": array of strings (MUST be [] for replies and [] when no assumptions are needed; max 3 items)
 - "plan": null when kind is "reply" or "edit", OR the complete plan object when kind is "plan"
-- "ops": null when kind is "reply" or "plan", OR a non-empty array of valid ops when kind is "edit"
+- "opsJson": null when kind is "reply" or "plan", OR a JSON string containing a non-empty array of valid op objects when kind is "edit"
 
 Example 1 (reply):
 {
   "kind": "reply",
-  "message": "I can design crisp 2D motion graphics with animated typography, geometric shapes, SVG icons, charts, and synthesized background music plus sound effects, though I cannot include live-action photographs or synthesized voice-over speech. Would you like me to plan a kinetic text ad with matching music?",
+  "message": "I can design crisp 2D motion graphics with animated typography, geometric shapes, SVG icons, charts, and synthesized background music plus sound effects. Would you like me to plan a kinetic text ad with matching music?",
   "assumptions": [],
   "plan": null,
-  "ops": null
+  "opsJson": null
 }
 
 Example 2 (plan):
@@ -110,7 +97,7 @@ Example 2 (plan):
     "Targeting SaaS founders on social feeds",
     "Using a high-contrast dark palette"
   ],
-  "ops": null,
+  "opsJson": null,
   "plan": {
     "title": "Pulse AI Launch",
     "style": {
@@ -176,10 +163,7 @@ Example 3 (edit):
   "message": "Switched the video to a deep blue ocean palette and updated the opening headline.",
   "assumptions": [],
   "plan": null,
-  "ops": [
-    { "type": "setPalette", "palette": "ocean" },
-    { "type": "setSlot", "scene": 0, "slot": "headline", "value": "Launch faster today" }
-  ]
+  "opsJson": "[{\"type\":\"setPalette\",\"palette\":\"ocean\"},{\"type\":\"setSlot\",\"scene\":0,\"slot\":\"headline\",\"value\":\"Launch faster today\"}]"
 }`;
 }
 
@@ -318,6 +302,53 @@ export function buildDirectorContextMessage(params: {
   return sections.join('\n');
 }
 
+export function buildCompactSceneSummary(
+  currentSpec?: VideoSpec | null,
+  currentPlan?: Plan | null
+): string {
+  if (currentSpec && currentSpec.scenes.length > 0) {
+    return currentSpec.scenes
+      .map((s, idx) => {
+        const slotKeys = Object.keys(s.slots ?? {}).join(',');
+        return `#${idx} id=${s.id} layout=${s.layout} dur=${s.dur}s slots=[${slotKeys}]`;
+      })
+      .join('\n');
+  }
+  if (currentPlan && currentPlan.scenes.length > 0) {
+    return currentPlan.scenes
+      .map(
+        (s, idx) =>
+          `#${idx} id=${s.id} name="${s.name}" dur=${s.durationSeconds}s`
+      )
+      .join('\n');
+  }
+  return 'No scenes found.';
+}
+
+export function buildDirectorEditRepairPrompt(params: {
+  userPrompt: string;
+  currentSpec?: VideoSpec | null;
+  currentPlan?: Plan | null;
+  validationErrors: string[];
+}): string {
+  return [
+    'Your previous edit ops could not be applied.',
+    '',
+    'USER REQUEST:',
+    params.userPrompt.trim(),
+    '',
+    'SCENE SUMMARY:',
+    buildCompactSceneSummary(params.currentSpec, params.currentPlan),
+    '',
+    describeOpsForAI(),
+    '',
+    'ERRORS:',
+    ...params.validationErrors.map((e) => `- ${e}`),
+    '',
+    'Return ONLY valid JSON: { "kind": "edit", "message": "what changed", "assumptions": [], "plan": null, "opsJson": "[{...}]" } with at least 1 valid op from the catalog.',
+  ].join('\n');
+}
+
 export function buildDirectorRepairPrompt(params: {
   projectType: VideoType;
   invalidOutput: string;
@@ -328,10 +359,10 @@ export function buildDirectorRepairPrompt(params: {
     'Your previous JSON output failed schema validation and must be repaired.',
     '',
     'UNIFIED OUTPUT CONTRACT:',
-    '{ "kind": "reply" | "plan" | "edit", "message": string, "assumptions": string[], "plan": Plan | null, "ops": Op[] | null }',
-    '- If kind is "reply": "message" is non-empty text, "assumptions" is [], "plan" is null, and "ops" is null.',
-    `- If kind is "plan": "message" is a non-empty intro, "assumptions" has 0–3 strings ([] if none), "ops" is null, and "plan" is a complete Plan object (1–8 scenes, each scene 1.5s–15s, total duration between ${limits.min}s and ${limits.max}s for "${params.projectType}", #RRGGBB hex colors, onScreenText lines <= 60 chars).`,
-    '- If kind is "edit": "message" is a non-empty summary of the changes, "assumptions" has 0–3 strings ([] if none), "plan" is null, and "ops" is a non-empty array of valid ops.',
+    '{ "kind": "reply" | "plan" | "edit", "message": string, "assumptions": string[], "plan": Plan | null, "opsJson": string | null }',
+    '- If kind is "reply": "message" is non-empty text, "assumptions" is [], "plan" is null, and "opsJson" is null.',
+    `- If kind is "plan": "message" is a non-empty intro, "assumptions" has 0–3 strings ([] if none), "opsJson" is null, and "plan" is a complete Plan object (1–8 scenes, each scene 1.5s–15s, total duration between ${limits.min}s and ${limits.max}s for "${params.projectType}", #RRGGBB hex colors, onScreenText lines <= 60 chars).`,
+    '- If kind is "edit": "message" is a non-empty summary of the changes, "assumptions" has 0–3 strings ([] if none), "plan" is null, and "opsJson" is a JSON-stringified non-empty array of valid ops.',
     '',
     'EXACT VALIDATION ERRORS TO FIX:',
     ...params.validationErrors.map((err) => `- "${err}"`),

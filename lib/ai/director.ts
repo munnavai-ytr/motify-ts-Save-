@@ -24,13 +24,15 @@ import {
   type DirectorOutput,
   type RawPlanAudio,
 } from '@/lib/ai/plan-schema';
+import { isBengaliText } from '@/lib/agent/intent';
 import {
   buildDirectorContextMessage,
+  buildDirectorEditRepairPrompt,
   buildDirectorRepairPrompt,
   buildDirectorSystemPrompt,
 } from '@/lib/ai/prompts/director';
 import { updateProject } from '@/lib/db';
-import { applyOps } from '@/lib/kit/ops';
+import { applyOps, validateAndFilterOps, type Op } from '@/lib/kit/ops';
 import type { AudioSpec } from '@/lib/kit/audio/types';
 import { hashTitleToSeed, type VideoSpec } from '@/lib/kit/spec';
 import type {
@@ -80,6 +82,7 @@ export type DirectorTurnResult =
       updatedFormat?: VideoFormat;
       updatedProject?: Project;
       updatedSpec?: VideoSpec;
+      warnings?: string[];
     }
   | {
       ok: false;
@@ -219,6 +222,91 @@ function mapRawPlanAudio(
   };
 }
 
+type ValidateDirectorResult =
+  | {
+      valid: true;
+      output: DirectorOutput;
+      warnings?: string[];
+    }
+  | {
+      valid: false;
+      errors: string[];
+      isEditCandidate?: boolean;
+    };
+
+function tryExtractEditOps(
+  normalizedJson: unknown,
+  currentSpec: VideoSpec | null | undefined,
+  isBn: boolean
+):
+  | { matched: false }
+  | {
+      matched: true;
+      ok: true;
+      output: { kind: 'edit'; message: string; assumptions: string[]; ops: Op[] };
+      warnings: string[];
+    }
+  | {
+      matched: true;
+      ok: false;
+      errors: string[];
+    } {
+  if (!normalizedJson || typeof normalizedJson !== 'object' || Array.isArray(normalizedJson)) {
+    return { matched: false };
+  }
+  const obj = normalizedJson as Record<string, unknown>;
+  if (obj.kind !== 'edit') {
+    return { matched: false };
+  }
+
+  const rawOps = Array.isArray(obj.ops) ? obj.ops : [];
+  if (rawOps.length === 0) {
+    const parseHint =
+      typeof obj.ops === 'string' && obj.ops.trim().length > 0
+        ? `opsJson could not be parsed as a JSON array: ${obj.ops.slice(0, 180)}`
+        : 'opsJson must be a JSON array with at least one valid op.';
+    return { matched: true, ok: false, errors: [parseHint] };
+  }
+
+  const { validOps, warnings, errors } = validateAndFilterOps(
+    rawOps,
+    currentSpec
+  );
+  if (validOps.length === 0) {
+    return {
+      matched: true,
+      ok: false,
+      errors:
+        errors.length > 0
+          ? errors
+          : ['No valid ops remained after validating opsJson against the video spec.'],
+    };
+  }
+
+  const rawMessage = typeof obj.message === 'string' ? obj.message.trim() : '';
+  const message =
+    rawMessage ||
+    (isBn ? 'ভিডিওটি আপডেট করা হয়েছে।' : 'Updated the video.');
+  const assumptions = Array.isArray(obj.assumptions)
+    ? obj.assumptions
+        .filter((a): a is string => typeof a === 'string' && a.trim().length > 0)
+        .map((a) => a.trim())
+        .slice(0, 3)
+    : [];
+
+  return {
+    matched: true,
+    ok: true,
+    output: {
+      kind: 'edit',
+      message,
+      assumptions,
+      ops: validOps,
+    },
+    warnings,
+  };
+}
+
 function validateDirectorOutput(
   rawText: string,
   projectType: VideoType,
@@ -229,9 +317,7 @@ function validateDirectorOutput(
     hasExistingVideo?: boolean;
     currentSpec?: VideoSpec | null;
   }
-):
-  | { valid: true; output: DirectorOutput }
-  | { valid: false; errors: string[] } {
+): ValidateDirectorResult {
   let parsedJson: unknown;
   try {
     parsedJson = extractJsonFromText(rawText);
@@ -241,6 +327,36 @@ function validateDirectorOutput(
   }
 
   const normalizedJson = normalizeDirectorPayload(parsedJson);
+  const isBn = isBengaliText(userPrompt);
+  const editCandidate = tryExtractEditOps(
+    normalizedJson,
+    options?.currentSpec,
+    isBn
+  );
+
+  if (editCandidate.matched) {
+    if (!options?.hasExistingVideo && !options?.hasCurrentPlan) {
+      return {
+        valid: false,
+        errors: [
+          'Cannot use kind "edit" when no existing video or plan exists yet; return kind "plan" instead.',
+        ],
+      };
+    }
+    if (editCandidate.ok) {
+      return {
+        valid: true,
+        output: editCandidate.output,
+        warnings: editCandidate.warnings,
+      };
+    }
+    return {
+      valid: false,
+      errors: editCandidate.errors,
+      isEditCandidate: true,
+    };
+  }
+
   const zodResult = DirectorOutputSchema.safeParse(normalizedJson);
   if (!zodResult.success) {
     return {
@@ -258,15 +374,6 @@ function validateDirectorOutput(
           'Cannot use kind "edit" when no existing video or plan exists yet; return kind "plan" instead.',
         ],
       };
-    }
-    if (options?.currentSpec) {
-      const check = applyOps(options.currentSpec, parsedOutput.ops);
-      if (check.errors.length > 0) {
-        return {
-          valid: false,
-          errors: check.errors,
-        };
-      }
     }
     return { valid: true, output: parsedOutput };
   }
@@ -511,6 +618,9 @@ export async function runDirectorTurn(
       return {
         ok: true,
         output: normalizedOutput,
+        ...(firstValidation.warnings && firstValidation.warnings.length > 0
+          ? { warnings: firstValidation.warnings }
+          : {}),
         ...formatChange,
         debugInfo: {
           modelName: answeringModel,
@@ -538,22 +648,46 @@ export async function runDirectorTurn(
       `Fixing ${errCount} ${errCount === 1 ? 'issue' : 'issues'}`
     );
 
-    const repairPrompt = buildDirectorRepairPrompt({
-      projectType: input.projectType,
-      invalidOutput: firstCall.text,
-      validationErrors: firstValidation.errors,
-    });
+    const isCompactEditRepair = Boolean(firstValidation.isEditCandidate);
+    const repairContents: GeminiContent[] = isCompactEditRepair
+      ? [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: buildDirectorEditRepairPrompt({
+                  userPrompt: input.userPrompt,
+                  currentSpec: input.currentSpec,
+                  currentPlan: input.currentPlan,
+                  validationErrors: firstValidation.errors,
+                }),
+              },
+            ],
+          },
+        ]
+      : [
+          ...contents,
+          { role: 'model', parts: [{ text: firstCall.text }] },
+          {
+            role: 'user',
+            parts: [
+              {
+                text: buildDirectorRepairPrompt({
+                  projectType: input.projectType,
+                  invalidOutput: firstCall.text,
+                  validationErrors: firstValidation.errors,
+                }),
+              },
+            ],
+          },
+        ];
 
     const repairCall = await callGeminiWithPolicy({
       apiKey: input.apiKey,
       modelName: input.modelName,
       backupModelName: input.backupModelName,
-      systemInstruction,
-      contents: [
-        ...contents,
-        { role: 'model', parts: [{ text: firstCall.text }] },
-        { role: 'user', parts: [{ text: repairPrompt }] },
-      ],
+      systemInstruction: isCompactEditRepair ? undefined : systemInstruction,
+      contents: repairContents,
       temperature: 0.2,
       responseMimeType: 'application/json',
       responseSchema: GEMINI_DIRECTOR_RESPONSE_SCHEMA,
@@ -602,6 +736,9 @@ export async function runDirectorTurn(
       return {
         ok: true,
         output: normalizedOutput,
+        ...(repairValidation.warnings && repairValidation.warnings.length > 0
+          ? { warnings: repairValidation.warnings }
+          : {}),
         ...formatChange,
         debugInfo: {
           modelName: answeringModel,
@@ -619,10 +756,46 @@ export async function runDirectorTurn(
       };
     }
 
+    // Graceful degradation for failed edit turns: never surface an ugly format error card for edits
+    if (isCompactEditRepair || repairValidation.isEditCandidate) {
+      const isBn = isBengaliText(input.userPrompt);
+      return {
+        ok: true,
+        output: {
+          kind: 'reply',
+          text: isBn
+            ? 'আমি ওই পরিবর্তনটি ঠিকভাবে বুঝতে পারিনি। কোন সিন বা কোন রঙ পরিবর্তন করতে চান বলুন।'
+            : 'I could not understand that change. Tell me which scene or color to change.',
+        },
+        warnings: repairValidation.errors,
+        debugInfo: {
+          modelName: answeringModel,
+          requestedModelName: input.modelName,
+          usedBackupModel,
+          usedStructuredSchema,
+          repaired: true,
+          timestamp: new Date().toISOString(),
+          requestContext: baseDebugContext,
+          rawModelOutput,
+          repairModelOutput: repairCall.text,
+          validationErrors: [
+            ...firstValidation.errors,
+            ...repairValidation.errors,
+          ],
+          usageMetadata: totalUsage,
+        },
+      };
+    }
+
+    const isBn = isBengaliText(input.userPrompt);
     return {
       ok: false,
-      summary: 'The AI returned an invalid plan format after a repair attempt.',
-      userAction: 'Try rephrasing your request or click Retry.',
+      summary: isBn
+        ? 'আমি ওই ভিডিও প্ল্যানের ফরম্যাটটি বুঝতে পারিনি। একটু ভিন্নভাবে লিখে আবার চেষ্টা করুন।'
+        : 'I could not understand that video plan format. Try rephrasing your request or click Retry.',
+      userAction: isBn
+        ? 'নতুন করে লিখুন অথবা Retry-তে ক্লিক করুন।'
+        : 'Try rephrasing your request or click Retry.',
       details: [
         'Initial validation errors:',
         ...firstValidation.errors.map((e) => `• ${e}`),

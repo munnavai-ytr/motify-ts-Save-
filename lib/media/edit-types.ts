@@ -243,6 +243,16 @@ export type NormalizeEditSpecResult =
   | { ok: true; spec: EditSpec; warnings: string[] }
   | { ok: false; errors: string[] };
 
+export interface MediaMetaEntry {
+  kind: 'video' | 'image' | 'audio' | 'file';
+  duration?: number;
+}
+
+export interface FillTrackDefaultsResult {
+  rawSpec: unknown;
+  warnings: string[];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -282,6 +292,214 @@ function stripNullOptionalKeys(
       delete obj[key];
     }
   }
+}
+
+function roundTime(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+function isMissingNumber(value: unknown): boolean {
+  return value === undefined || value === null || typeof value !== 'number' || !Number.isFinite(value);
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+export function fillTrackDefaults(
+  rawSpec: unknown,
+  mediaMeta: Record<string, MediaMetaEntry>
+): FillTrackDefaultsResult {
+  const warnings: string[] = [];
+  let parsed: unknown = rawSpec;
+
+  if (typeof rawSpec === 'string') {
+    try {
+      parsed = JSON.parse(rawSpec) as unknown;
+    } catch {
+      return { rawSpec, warnings };
+    }
+  }
+
+  if (!isRecord(parsed) || !Array.isArray(parsed.tracks) || parsed.tracks.length === 0) {
+    return { rawSpec: parsed, warnings };
+  }
+
+  const rawTracks: unknown[] = parsed.tracks;
+  const nextSpec: Record<string, unknown> = { ...parsed };
+  const rawTotal = nextSpec.totalSeconds;
+  const hasValidTotal =
+    typeof rawTotal === 'number' && Number.isFinite(rawTotal) && rawTotal > 0;
+  const totalForSlot = hasValidTotal
+    ? Math.min(rawTotal as number, MAX_TIMELINE_SECONDS)
+    : 15;
+
+  const videoTrackCount = rawTracks.filter(
+    (t) => isRecord(t) && t.kind === 'video'
+  ).length;
+  const slot = clampNumber(totalForSlot / Math.max(1, videoTrackCount), 1.5, 8);
+
+  let runningTimelineSec = 0;
+
+  nextSpec.tracks = rawTracks.map((rawTrack, idx) => {
+    if (!isRecord(rawTrack)) return rawTrack;
+    const track: Record<string, unknown> = { ...rawTrack };
+    const trackNum = idx + 1;
+    const mediaId = typeof track.mediaId === 'string' ? track.mediaId.trim() : '';
+    const meta = mediaId ? mediaMeta[mediaId] : undefined;
+    const knownDur =
+      meta &&
+      typeof meta.duration === 'number' &&
+      Number.isFinite(meta.duration) &&
+      meta.duration > 0
+        ? meta.duration
+        : undefined;
+
+    if (track.kind === 'video') {
+      if (isMissingNumber(track.startAt) || (track.startAt as number) < 0) {
+        track.startAt = roundTime(runningTimelineSec);
+        warnings.push(`Filled missing start time for track ${trackNum}`);
+      }
+
+      if (isMissingNumber(track.speed) || (track.speed as number) <= 0) {
+        track.speed = 1;
+      }
+      const effectiveSpeed = clampNumber(track.speed as number, 0.5, 2);
+
+      const isImageStill = meta?.kind === 'image';
+      const maxSourceDur = !isImageStill && knownDur !== undefined ? knownDur : undefined;
+
+      let filledTrim = false;
+      let inPoint: number;
+      if (isMissingNumber(track.inPoint) || (track.inPoint as number) < 0) {
+        inPoint = isImageStill ? 0 : 0.3;
+        filledTrim = true;
+      } else {
+        inPoint = track.inPoint as number;
+      }
+
+      if (maxSourceDur !== undefined) {
+        const maxIn = Math.max(0, maxSourceDur - 0.5);
+        if (inPoint > maxIn) {
+          inPoint = maxIn;
+          filledTrim = true;
+        }
+      }
+
+      let outPoint: number;
+      if (isMissingNumber(track.outPoint) || (track.outPoint as number) <= 0) {
+        filledTrim = true;
+        if (maxSourceDur !== undefined) {
+          const upperCap = maxSourceDur > 0.7 ? maxSourceDur - 0.2 : maxSourceDur;
+          outPoint = Math.min(upperCap, inPoint + slot);
+        } else {
+          outPoint = inPoint + slot;
+        }
+      } else {
+        outPoint = track.outPoint as number;
+      }
+
+      if (maxSourceDur !== undefined) {
+        if (outPoint > maxSourceDur) {
+          outPoint = maxSourceDur;
+          filledTrim = true;
+        }
+        if (outPoint < inPoint + 0.5) {
+          if (maxSourceDur >= inPoint + 0.5) {
+            outPoint = Math.min(maxSourceDur, inPoint + 0.5);
+            filledTrim = true;
+          } else if (maxSourceDur >= 0.5) {
+            inPoint = Math.max(0, maxSourceDur - 0.5);
+            outPoint = maxSourceDur;
+            filledTrim = true;
+          } else {
+            inPoint = 0;
+            outPoint = Math.max(0.1, maxSourceDur);
+            filledTrim = true;
+          }
+        }
+      } else if (outPoint < inPoint + 0.5) {
+        outPoint = inPoint + 0.5;
+        filledTrim = true;
+      }
+
+      track.inPoint = roundTime(inPoint);
+      track.outPoint = roundTime(outPoint);
+      if (filledTrim) {
+        warnings.push(`Filled missing trim points for track ${trackNum}`);
+      }
+
+      const clipDur = Math.max(
+        0.1,
+        ((track.outPoint as number) - (track.inPoint as number)) / effectiveSpeed
+      );
+      runningTimelineSec = (track.startAt as number) + clipDur;
+    } else if (track.kind === 'audio') {
+      if (isMissingNumber(track.startAt) || (track.startAt as number) < 0) {
+        track.startAt = 0;
+        warnings.push(`Filled missing start time for track ${trackNum}`);
+      }
+
+      let inPoint =
+        !isMissingNumber(track.inPoint) && (track.inPoint as number) >= 0
+          ? (track.inPoint as number)
+          : 0;
+      if (knownDur !== undefined && inPoint >= knownDur) {
+        inPoint = 0;
+      }
+      track.inPoint = roundTime(inPoint);
+
+      if (!isMissingNumber(track.outPoint)) {
+        let outPoint = track.outPoint as number;
+        if (knownDur !== undefined && outPoint > knownDur) {
+          outPoint = knownDur;
+        }
+        if (outPoint <= inPoint) {
+          if (knownDur !== undefined && knownDur > inPoint + 0.2) {
+            outPoint = knownDur;
+          } else {
+            delete track.outPoint;
+            outPoint = -1;
+          }
+        }
+        if (outPoint > inPoint) {
+          track.outPoint = roundTime(outPoint);
+        }
+      }
+    } else if (track.kind === 'overlay') {
+      if (isMissingNumber(track.startAt) || (track.startAt as number) < 0) {
+        track.startAt = 0;
+        warnings.push(`Filled missing start time for track ${trackNum}`);
+      }
+      if (isMissingNumber(track.duration) || (track.duration as number) <= 0) {
+        track.duration = 2.5;
+        warnings.push(`Filled missing duration for track ${trackNum}`);
+      }
+      if (isMissingNumber(track.scale)) {
+        track.scale = 0.25;
+      }
+      if (isMissingNumber(track.opacity)) {
+        track.opacity = 1;
+      }
+    } else if (track.kind === 'mg') {
+      if (isMissingNumber(track.startAt) || (track.startAt as number) < 0) {
+        track.startAt = roundTime(runningTimelineSec);
+        warnings.push(`Filled missing start time for track ${trackNum}`);
+      }
+      if (isMissingNumber(track.duration) || (track.duration as number) <= 0) {
+        track.duration = 2.5;
+        warnings.push(`Filled missing duration for track ${trackNum}`);
+      } else if ((track.duration as number) > 5) {
+        track.duration = 5;
+        warnings.push(`Clamped MG duration for track ${trackNum} to 5s`);
+      }
+      runningTimelineSec = (track.startAt as number) + (track.duration as number);
+    }
+
+    return track;
+  });
+
+  return { rawSpec: nextSpec, warnings };
 }
 
 export function normalizeEditSpec(raw: unknown): NormalizeEditSpecResult {
